@@ -1,0 +1,10 @@
+runs/
+data_out/
+*.safetensors
+*.bin
+wandb/
+__pycache__/
+.venv/
+.env
+*.parquet
+.remember/

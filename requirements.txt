@@ -1,0 +1,12 @@
+# Tested with Python 3.11
+trl>=0.21.0
+transformers>=4.51.0
+peft>=0.13.0
+accelerate>=0.34.0
+datasets>=3.0.0
+bitsandbytes>=0.43.0
+vllm>=0.6.0
+pyyaml
+huggingface_hub>=0.25.0
+wandb
+pytest

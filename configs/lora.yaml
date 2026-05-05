@@ -1,0 +1,49 @@
+# =============================================================================
+# emainelpe-shared / lora.yaml
+# -----------------------------------------------------------------------------
+# LOCKED — DO NOT EDIT WITHOUT TEAM AGREEMENT.
+#
+# This file is the single source of truth for the LoRA shape used by all
+# four experts (math, general_knowledge, multilingual, safety).
+#
+# Identical rank, alpha, and target_modules across all four experts is a
+# REQUIREMENT for DARE + AdaMerging to compose the adapters into the group
+# model in Phase 3. Divergence here will silently break the merge.
+#
+# Per-expert hyperparameters (learning rate, epochs, batch size, schedule)
+# are NOT locked and should live in each person's own training script.
+# =============================================================================
+
+base_model: "Qwen/Qwen3-1.7B"
+
+lora:
+  # Adapter shape — LOCKED across all four experts
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+  # Target modules — LOCKED across all four experts
+  # All linear projections in attention + MLP. Attention-only LoRA
+  # consistently underperforms on reasoning tasks at the 1.7B scale.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# Tokenization — LOCKED
+max_seq_length: 4096        # CI eval cap; train at the same length
+eos_token: "<|im_end|>"     # Qwen3 chat-template terminator
+
+# Output policy — LOCKED
+# All experts must produce <think>...</think> reasoning followed by
+# a final answer in \boxed{...}. Thinking mode is forced ON in the
+# shared chat_template.jinja (the CI does not pass enable_thinking
+# as a kwarg, so the template is the only signal we control).
+thinking_mode: "on"
+boxed_answers: true
