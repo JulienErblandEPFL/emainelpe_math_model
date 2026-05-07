@@ -207,7 +207,8 @@ stops predicting CI pass@1.
 - Input: a JSONL file with `{"prompt": "...", "answer": "..."}` per line
   (matches the course's validation snapshot format)
 - Output: pass@1 and pass@8 numbers, plus optional per-question dump
-- Use vLLM with bf16. **`max_model_len` ≥ prompt(≤4096) + `max_new_tokens`(16384) ⇒ default 20480** (Qwen3-1.7B's positional ceiling accommodates this; verify on first run)
+- Use vLLM with bf16. **`max_model_len` ≥ prompt(≤4096) + `max_new_tokens`(16384) ⇒ default 20480.** Verify Qwen3-1.7B's positional ceiling supports this on the cluster before pinning the default — one-line check:
+  `print(AutoConfig.from_pretrained('Qwen/Qwen3-1.7B').max_position_embeddings)`
 - Apply chat template via `tokenizer.apply_chat_template(..., add_generation_prompt=True)`
 - SamplingParams:
   - **`n=8`** (CI contract)
@@ -238,6 +239,13 @@ flying blind between HF pushes (which only get evaluated nightly).
 **Goal.** Take the trained LoRA adapter, merge it into the base model
 weights, write `generation_config.json`, and push the full checkpoint to
 `cs-552-2026-emainelpe/math_model`.
+
+**Sets the eval-time contract.** The CI samples with the values written
+into `generation_config.json` here (see "Eval contract" in `CLAUDE.md`).
+Defaults to consider for math: `temperature=0.3, top_p=0.95, top_k=20`.
+Run a 50-sample temperature sweep on the clean eval before the June 7
+final push to confirm these values — small change, high leverage on
+pass@1.
 
 **Files to create:**
 - `scripts/merge_and_push.py`
