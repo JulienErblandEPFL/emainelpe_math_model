@@ -226,6 +226,11 @@ def smoke_inference(model, tokenizer) -> None:
     Catches "trained but broken" failure modes (NaN logits, empty
     generation, missing chat template) before Stage 4 evaluation runs.
     Always runs; not configurable on purpose.
+
+    ``max_new_tokens=2048`` is enough to clear the ``<think>`` block and
+    emit a closing ``</think>`` + ``\\boxed{...}`` for a trivial-arithmetic
+    prompt. The first smoke (2026-05-07) used 128 and truncated mid-think,
+    making format verification impossible.
     """
     import torch  # local import; main() already pulled torch in
 
@@ -238,7 +243,7 @@ def smoke_inference(model, tokenizer) -> None:
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            max_new_tokens=128,
+            max_new_tokens=2048,
             do_sample=False,
         )
     decoded = tokenizer.decode(out[0], skip_special_tokens=False)
@@ -282,15 +287,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _resolve_resume(arg: str | None, output_dir: Path):
+    """Resolve ``--resume`` to a concrete checkpoint path or ``None``.
+
+    Sorts by the integer step suffix, NOT lexicographically: HF Trainer
+    names checkpoints ``checkpoint-{global_step}``, and a lexicographic
+    sort would pick ``checkpoint-9500`` over ``checkpoint-16000``.
+    """
     if arg is None:
         return None
     if arg == "latest":
-        ckpts = sorted(output_dir.glob("checkpoint-*"))
+        ckpts = list(output_dir.glob("checkpoint-*"))
         if not ckpts:
             raise FileNotFoundError(
                 f"--resume latest: no checkpoint-* directories under {output_dir}"
             )
-        return str(ckpts[-1])
+        latest = max(ckpts, key=lambda p: int(p.name.split("-")[1]))
+        return str(latest)
     return arg
 
 
