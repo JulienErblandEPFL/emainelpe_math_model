@@ -26,6 +26,61 @@ logger = logging.getLogger(__name__)
 
 _BOXED_OPEN = re.compile(r"\\boxed\s*\{")
 
+# Literal trailing fragments that show up right before \boxed{...} and
+# become orphans once the boxed payload is extracted. Checked in this
+# order; longer LaTeX openers must come before their shorter prefixes
+# (e.g., '$$' before '$') so endswith picks the longer match.
+_TRAILING_DELIMITERS: tuple[str, ...] = ("$$", "$", r"\[", r"\(")
+
+# Answer-preamble phrases. Stored lowercase and matched
+# case-insensitively against the suffix of the (rstripped) text. Order
+# matters: the longer 'the answer is:' must be tried before the bare
+# 'the answer is' so the colon-terminated form is consumed in one pass.
+_TRAILING_PHRASES: tuple[str, ...] = (
+    "the answer is:",
+    "the answer is",
+    "final answer:",
+    "answer:",
+)
+
+
+def strip_trailing_preamble(text: str, max_iterations: int = 10) -> str:
+    """Iteratively strip orphan math-mode delimiters and answer-preamble
+    phrases from the END of *text*.
+
+    Conservative by design: only literal patterns anchored to the suffix
+    are removed. Patterns that appear mid-text are untouched. Phrase
+    matches require the prior character to be whitespace (or the phrase
+    to be the entire string) so we don't slice into a word.
+
+    The cascade is iterative because patterns nest:
+    ``"reasoning. The answer is: $"`` requires stripping ``$`` first,
+    then ``The answer is:``. The ``max_iterations`` cap is defensive
+    only; convergence is reached in <=4 passes for any plausible input.
+    """
+    for _ in range(max_iterations):
+        new = _strip_one_pass(text)
+        if new == text:
+            break
+        text = new
+    return text.rstrip()
+
+
+def _strip_one_pass(text: str) -> str:
+    text = text.rstrip()
+    if not text:
+        return text
+    for delim in _TRAILING_DELIMITERS:
+        if text.endswith(delim):
+            return text[: -len(delim)]
+    lower = text.lower()
+    for phrase in _TRAILING_PHRASES:
+        if lower.endswith(phrase):
+            start = len(text) - len(phrase)
+            if start == 0 or text[start - 1].isspace():
+                return text[:start]
+    return text
+
 
 def extract_last_boxed(text: str) -> tuple[str, str] | None:
     """Return ``(text_before_boxed, content_inside_boxed)`` for the LAST
@@ -105,18 +160,33 @@ def build_pipeline(
     per_question_cap: int,
     eval_size: int,
     max_response_chars: int,
+    min_reasoning_chars: int,
+    max_answer_chars: int,
     seed: int,
 ) -> tuple[list[dict], list[dict]]:
     """Filter → cap → subsample → shuffle → split.
 
     Returns ``(train_examples, eval_examples)`` as TRL chat dicts. Pure over
     the input iterable — no I/O, no dataset library needed.
+
+    Per-row pipeline:
+      1. response length cap (pre-extract early-out)
+      2. extract_last_boxed → (text_before_boxed, content_inside_boxed)
+      3. answer length cap (max_answer_chars)
+      4. strip_trailing_preamble on text_before_boxed
+      5. reasoning length floor (min_reasoning_chars) — applied to the
+         CLEANED text so e.g. "reasoning $" becomes "reasoning" before
+         being measured
     """
     rng = random.Random(seed)
 
     kept: list[dict] = []
     n_no_box = 0
     n_too_long = 0
+    n_too_short_reasoning = 0
+    n_too_long_answer = 0
+    n_strip_called = 0
+    n_strip_fired = 0
     for row in raw_rows:
         response = row["response"]
         if len(response) > max_response_chars:
@@ -126,13 +196,30 @@ def build_pipeline(
         if result is None:
             n_no_box += 1
             continue
-        reasoning, answer = result
+        raw_reasoning, answer = result
+        if len(answer) > max_answer_chars:
+            n_too_long_answer += 1
+            continue
+        n_strip_called += 1
+        reasoning = strip_trailing_preamble(raw_reasoning)
+        if reasoning != raw_reasoning.rstrip():
+            n_strip_fired += 1
+        if len(reasoning) < min_reasoning_chars:
+            n_too_short_reasoning += 1
+            continue
         kept.append(
             {"query": row["query"], "reasoning": reasoning, "answer": answer}
         )
     logger.info(
-        "filter: kept=%d dropped_no_box=%d dropped_too_long=%d",
+        "filter: kept=%d dropped_no_box=%d dropped_too_long=%d "
+        "dropped_too_short_reasoning=%d dropped_too_long_answer=%d",
         len(kept), n_no_box, n_too_long,
+        n_too_short_reasoning, n_too_long_answer,
+    )
+    strip_pct = (n_strip_fired / n_strip_called * 100) if n_strip_called else 0.0
+    logger.info(
+        "[prepare_sft] strip_trailing_preamble fired on %d/%d rows (%.1f%%)",
+        n_strip_fired, n_strip_called, strip_pct,
     )
 
     capped = apply_per_question_cap(kept, cap=per_question_cap, rng=rng)
@@ -163,6 +250,8 @@ def main() -> None:
     parser.add_argument("--eval-size", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-response-chars", type=int, default=8000)
+    parser.add_argument("--min-reasoning-chars", type=int, default=150)
+    parser.add_argument("--max-answer-chars", type=int, default=200)
     parser.add_argument("--dataset-name", default="hkust-nlp/dart-math-uniform")
     parser.add_argument("--split", default="train")
     parser.add_argument(
@@ -190,6 +279,8 @@ def main() -> None:
         per_question_cap=args.per_question_cap,
         eval_size=args.eval_size,
         max_response_chars=args.max_response_chars,
+        min_reasoning_chars=args.min_reasoning_chars,
+        max_answer_chars=args.max_answer_chars,
         seed=args.seed,
     )
 

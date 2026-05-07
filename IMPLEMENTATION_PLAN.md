@@ -85,6 +85,28 @@ ready for TRL's `SFTTrainer`.
 - A spot-check of 3 random output rows shows correctly formatted
   `<think>...</think>\n\n\boxed{...}` structure
 
+**Notes on dataset behavior (RCP dry-run findings).**
+- DART-Math-Uniform is *mixed format*. About 50% of rows end with
+  `\boxed{...}` (the canonical convention) and the rest use plain
+  "The answer is: $X$" or are corrupted token-salad. The pipeline
+  filters by presence of `\boxed{...}` and drops the rest. **A ~52% drop
+  rate on DART is expected behavior, not a bug.** With the dataset's
+  ~590k rows, ~280k survive — well above the 50k subsample target.
+- Purity filters layered on top of `\boxed{}` extraction:
+  - `--min-reasoning-chars` (default 150): drops rows whose cleaned
+    reasoning is too short to demonstrate step-by-step thinking.
+  - `--max-answer-chars` (default 200): drops rows with pathologically
+    long boxed payloads (token-salad with a box).
+- Trailing-fragment cleanup: after `extract_last_boxed`, the prose
+  before `\boxed{...}` often ends in orphan tokens like `$`, `$$`,
+  `\[`, or "The answer is:". `strip_trailing_preamble` removes a
+  conservative set of these so the `<think>` block reads cleanly. The
+  strip-rate is logged at INFO with the prefix `[prepare_sft]` so we
+  can verify the cleanup is firing on real data.
+- Pipeline ordering: extract_last_boxed → max_answer_chars →
+  strip_trailing_preamble → min_reasoning_chars. The strip runs BEFORE
+  the length floor so cleaned reasoning is what gets measured.
+
 ---
 
 ## Stage 2 — Local chat-template verification
