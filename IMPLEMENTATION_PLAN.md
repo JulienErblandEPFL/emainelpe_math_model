@@ -183,6 +183,14 @@ produced in Stage 1, using the locked LoRA config.
   `adapter_config.json`, `tokenizer_config.json`, and the chat template
 - W&B logs (or stdout if W&B is not set up) show declining loss
 
+**Verified end-to-end on RCP (2026-05-07).** Larger smoke (1000 ex,
+2 epochs, 60 steps): train_loss 0.9999 → 0.5678 → 0.6005, eval_loss
+0.6227 (close to train, no overfit), token accuracy 78% → 83%,
+token-length filter dropped 0/1000 rows, `chat_template` round-trip
+byte-identical after save. Smoke inference for "What is 2+2?" returned
+well-formed `<think>\n2+2=4\n</think>\n\n\boxed{4}` — exact shape of
+the training-data format produced by `data/prepare_sft.format_response`.
+
 **Note.** The actual full SFT run is a separate operational task — submit
 via `rcp/submit_train.sh`, monitor logs, expect 8-12 hours. That's not
 something Claude Code does; that's the user. The script just has to be
