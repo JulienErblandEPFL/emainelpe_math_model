@@ -77,18 +77,27 @@ team sign-off, then update.
 
 ## Eval contract — what the CI runs against the pushed checkpoint
 
-Encoded from `docs/project_description.pdf`. These are NOT design choices
-we made; they are the parameters the course CI exercises against the model
-on HF, and our local eval (`scripts/eval_local.py`, Stage 4) MUST mirror
-them to be predictive of CI scores.
+Encoded from `docs/project_description.pdf` and pinned to the vendored
+copy of the CI scoring code at `evaluate/`. These are NOT design choices
+we made; they are the parameters the course CI exercises against the
+model on HF, and our local eval (`scripts/eval_local.py`, Stage 4) MUST
+mirror them to be predictive of CI scores.
 
 | Parameter | Value | Notes |
 |---|---|---|
-| Framework | OpenCompass | `\boxed{...}` extraction; the model must place the final answer there |
+| Framework | OpenCompass (vendored at `evaluate/`) | Byte-identical copy of the CI's scoring code. See `evaluate/README.md`. |
+| Extraction | `\boxed{...}` or `\fbox{...}`, last occurrence, brace-balanced | `evaluate.extract_answer.extract_boxed_answer` with `strip_double_curly_brace=True` (peels one extra `{...}` layer). No box → counted wrong. |
+| Equivalence | OpenCompass `is_equiv` (multi-stage) | NOT pure exact-match. `evaluate.extract_answer.is_equiv` runs `strip_string` → `normalize_final_answer` → fallback `==`. Aggressive math-specific: unit removal, `\text{}` peeling, `100,000 ↔ 100000`, `0.5 ↔ \frac{1}{2}`, TeX shorthand like `\fracab → \frac{a}{b}`. |
 | Seed | 42 | Fixed by the CI; same seed used in `data/prepare_sft.py` and `scripts/train_sft.py` for end-to-end reproducibility |
 | Completions per problem | n = 8 | Sampled with the model's `generation_config.json` (temp/top_p/top_k come from the pushed config — Stage 5) |
 | `max_new_tokens` | 16384 | **Eval-time only.** NOT a training choice. `lora.yaml:max_seq_length=4096` is the training cap; do not conflate the two |
-| Metrics | pass@1, pass@8 | pass@1 from a single sample; pass@8 = any-of-8 success rate |
+| Metrics | pass@1, pass@8 | Unbiased Chen-et-al-2021 estimator (`evaluate.pass_at_k.pass_at_k`): `pass@k = 1 - C(n-c, k) / C(n, k)`. With n=8: pass@1 = mean(c/8) across problems; pass@8 = mean(any-of-8). |
+
+**Use the vendored `evaluate/` directly.** Do not re-implement extraction,
+`is_equiv`, or pass@k. The CI runs byte-identical code, and any
+re-implementation will silently drift. Stage 4's `scripts/eval_local.py`
+is a vLLM front-end whose only job is to produce a generations JSONL
+that `evaluate.score.score_generations` then scores.
 
 Why `max_new_tokens` is 16384 even though we trained at 4096: a model
 trained at 4096 seq-length CAN sample longer at inference because vLLM

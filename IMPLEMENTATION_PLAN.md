@@ -200,42 +200,74 @@ correct.
 
 ## Stage 4 — Local eval (mimicking the CI)
 
-**Goal.** A vLLM-based eval that loads a merged checkpoint, runs n=8
-completions per problem, extracts answers via `\boxed{...}`, and reports
-pass@1 and pass@8.
+**Goal.** A vLLM front-end that loads a merged checkpoint, runs n=8
+completions per problem, dumps a generations JSONL in the schema
+`evaluate/score.py` expects, and pipes it through
+`evaluate.score.score_generations` to report pass@1 and pass@8.
 
-**Mirrors the CI contract.** All parameters below are pinned to match the
-"Eval contract" section in `CLAUDE.md`. Drift here means our local pass@1
-stops predicting CI pass@1.
+**Mirrors the CI contract by reuse, not re-implementation.** The
+`evaluate/` package vendored at the repo root is the CI's scoring code,
+byte-identical. Stage 4 wraps it; it does not replicate it. All sampling
+parameters below are pinned to match the "Eval contract" section in
+`CLAUDE.md`.
 
 **Files to create:**
 - `scripts/eval_local.py`
+- `scripts/tests/test_eval_local.py`
 
 **Key requirements (CI-mirrored values are bolded):**
-- Input: a JSONL file with `{"prompt": "...", "answer": "..."}` per line
-  (matches the course's validation snapshot format)
-- Output: pass@1 and pass@8 numbers, plus optional per-question dump
-- Use vLLM with bf16. **`max_model_len` ≥ prompt(≤4096) + `max_new_tokens`(16384) ⇒ default 20480.** Verify Qwen3-1.7B's positional ceiling supports this on the cluster before pinning the default — one-line check:
-  `print(AutoConfig.from_pretrained('Qwen/Qwen3-1.7B').max_position_embeddings)`
-- Apply chat template via `tokenizer.apply_chat_template(..., add_generation_prompt=True)`
+- Input: a JSONL file with `{"prompt": "...", "answer": "..."}` per line.
+  - Default `--eval-file validation_samples/math.jsonl` (the course's
+    vendored snapshot, 10 rows, OOD competition problems — matches what
+    the CI scores against).
+  - Secondary `--eval-file data_out/eval.jsonl` (the DART held-out slice
+    produced by `data/prepare_sft.py` — larger N, in-distribution, lower
+    variance). Same script, no new data prep required.
+- Outputs (under `--output-dir`):
+  - `generations.jsonl` — input rows with `completions` (list of n=8
+    strings) appended. Matches `evaluate/score.py`'s expected schema, so
+    re-scoring with a different `--method` is a one-liner without
+    re-running inference.
+  - `scored.json` — `evaluate.score.score_generations`'s full output:
+    pass@k metrics + per-problem detailed results (extracted answers,
+    per-completion correctness flags).
+  - stdout: one-line pass@1 / pass@8 summary.
+- Use vLLM with bf16. **`max_model_len` ≥ prompt(≤4096) + `max_new_tokens`(16384) ⇒ default 20480.** Runtime assertion in `main()`: refuse to run if `AutoConfig.from_pretrained(model).max_position_embeddings < max_model_len`.
+- Apply chat template via `tokenizer.apply_chat_template(..., add_generation_prompt=True)` AFTER overwriting `tokenizer.chat_template` with the locked Jinja (same idiom as `scripts/verify_chat_template.py` and `scripts/train_sft.py:smoke_inference`). vLLM receives pre-rendered prompt strings.
 - SamplingParams:
   - **`n=8`** (CI contract)
   - **`max_tokens=16384`** — eval-time `max_new_tokens`, NOT the training-time `max_seq_length=4096` from `lora.yaml`
   - **`seed=42`** (CI contract; same seed as data prep and SFT)
-  - `temperature` and `top_p` default to whatever the merged checkpoint's
-    `generation_config.json` ships (set in Stage 5). CLI override is
-    available for sweeps but the defaults must match the pushed config.
-- Boxed extraction: the LAST `\boxed{...}` in the completion, with
-  brace-balancing for nested expressions (matches OpenCompass behavior)
-- Answer normalization: strip whitespace, strip trailing periods
-- Comparison: exact string match after normalization (Stage 7 / v2 may
-  swap in a hybrid SymPy verifier; exact-match anchors the proposal commitment)
+  - `temperature` / `top_p` / `top_k` default to the merged checkpoint's
+    `generation_config.json` (set in Stage 5). Pre-Stage-5 fallback
+    defaults: `temp=0.3, top_p=0.95, top_k=20`. CLI override is
+    available for sweeps; the script logs a WARNING if any sampling
+    param is overridden so the operator notices the drift from the
+    pushed-checkpoint contract.
+- Scoring: import `evaluate.score.score_generations` and call with
+  `method="boxed"`. Do NOT write own extraction, normalization, or
+  pass@k math — the CI uses byte-identical code, and re-implementing
+  invites silent drift.
 
 **Done when.**
-- Running on the course's `validation_samples/math.jsonl` with a known
-  base model produces sensible numbers (i.e., not 0% and not 100%)
-- The script handles edge cases: completion with no `\boxed{}` (counts as
-  wrong), completion with malformed `\boxed{}` (counts as wrong)
+- CPU unit tests for the pure helpers (prompt construction given a fake
+  tokenizer, generations-dump JSONL shape, sampling-params override
+  warning, max_model_len assertion logic) pass on the user's laptop in
+  <5s without vLLM imports.
+- The script runs on `validation_samples/math.jsonl` with bare
+  `Qwen/Qwen3-1.7B` and produces non-trivial pass@1 (i.e., not 0% and
+  not 100%).
+- `generations.jsonl` is well-formed: re-feeding it through
+  `python -m evaluate.score --generations <file> --benchmark math`
+  reproduces the script's reported metrics byte-for-byte.
+
+**Noise budget on the default snapshot.** N=10 means the standard error
+on pass@1 is roughly ±5 percentage points; pass@8 is binary per problem
+and even chunkier. A 4-point swing between two checkpoints is within
+noise, not a real signal. For tighter signals, also run against
+`data_out/eval.jsonl` (500 rows from the DART held-out slice — different
+distribution, in-domain, much lower variance) and look for movement on
+both targets together.
 
 **Why this matters.** Local eval is the feedback loop. Without it you're
 flying blind between HF pushes (which only get evaluated nightly).
