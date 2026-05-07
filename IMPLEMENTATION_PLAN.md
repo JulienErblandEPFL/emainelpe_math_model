@@ -401,7 +401,7 @@ Stage 0 — Repo skeleton:                 DONE (2026-05-05)
 Stage 1 — Data preparation:              DONE (2026-05-07)
 Stage 2 — Chat-template verification:    DONE (2026-05-07)
 Stage 3 — SFT training script:           DONE (2026-05-07)
-Stage 4 — Local eval:                    NOT STARTED
+Stage 4 — Local eval:                    DONE (2026-05-07)
 Stage 5 — Merge and push:                NOT STARTED
 Stage 6 — RCP submission script:         NOT STARTED
 Stage 7 — RLVR:                          DEFERRED
