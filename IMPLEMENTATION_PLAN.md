@@ -196,21 +196,31 @@ correct.
 completions per problem, extracts answers via `\boxed{...}`, and reports
 pass@1 and pass@8.
 
+**Mirrors the CI contract.** All parameters below are pinned to match the
+"Eval contract" section in `CLAUDE.md`. Drift here means our local pass@1
+stops predicting CI pass@1.
+
 **Files to create:**
 - `scripts/eval_local.py`
 
-**Key requirements:**
+**Key requirements (CI-mirrored values are bolded):**
 - Input: a JSONL file with `{"prompt": "...", "answer": "..."}` per line
   (matches the course's validation snapshot format)
 - Output: pass@1 and pass@8 numbers, plus optional per-question dump
-- Use vLLM with bf16, max_model_len=4096
+- Use vLLM with bf16. **`max_model_len` ≥ prompt(≤4096) + `max_new_tokens`(16384) ⇒ default 20480** (Qwen3-1.7B's positional ceiling accommodates this; verify on first run)
 - Apply chat template via `tokenizer.apply_chat_template(..., add_generation_prompt=True)`
-- SamplingParams: n=8, max_tokens=4096, temperature and top_p from CLI args
-  (defaults: temperature=0.7, top_p=0.95)
+- SamplingParams:
+  - **`n=8`** (CI contract)
+  - **`max_tokens=16384`** — eval-time `max_new_tokens`, NOT the training-time `max_seq_length=4096` from `lora.yaml`
+  - **`seed=42`** (CI contract; same seed as data prep and SFT)
+  - `temperature` and `top_p` default to whatever the merged checkpoint's
+    `generation_config.json` ships (set in Stage 5). CLI override is
+    available for sweeps but the defaults must match the pushed config.
 - Boxed extraction: the LAST `\boxed{...}` in the completion, with
-  brace-balancing for nested expressions
+  brace-balancing for nested expressions (matches OpenCompass behavior)
 - Answer normalization: strip whitespace, strip trailing periods
-- Comparison: exact string match after normalization
+- Comparison: exact string match after normalization (Stage 7 / v2 may
+  swap in a hybrid SymPy verifier; exact-match anchors the proposal commitment)
 
 **Done when.**
 - Running on the course's `validation_samples/math.jsonl` with a known

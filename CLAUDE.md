@@ -75,6 +75,27 @@ shared source for the Phase 3 merge to work. Treat both as read-only.
 If a change is genuinely needed, propose it in the shared repo first, get
 team sign-off, then update.
 
+## Eval contract — what the CI runs against the pushed checkpoint
+
+Encoded from `docs/project_description.pdf`. These are NOT design choices
+we made; they are the parameters the course CI exercises against the model
+on HF, and our local eval (`scripts/eval_local.py`, Stage 4) MUST mirror
+them to be predictive of CI scores.
+
+| Parameter | Value | Notes |
+|---|---|---|
+| Framework | OpenCompass | `\boxed{...}` extraction; the model must place the final answer there |
+| Seed | 42 | Fixed by the CI; same seed used in `data/prepare_sft.py` and `scripts/train_sft.py` for end-to-end reproducibility |
+| Completions per problem | n = 8 | Sampled with the model's `generation_config.json` (temp/top_p/top_k come from the pushed config — Stage 5) |
+| `max_new_tokens` | 16384 | **Eval-time only.** NOT a training choice. `lora.yaml:max_seq_length=4096` is the training cap; do not conflate the two |
+| Metrics | pass@1, pass@8 | pass@1 from a single sample; pass@8 = any-of-8 success rate |
+
+Why `max_new_tokens` is 16384 even though we trained at 4096: a model
+trained at 4096 seq-length CAN sample longer at inference because vLLM
+extends the KV cache up to the model's positional ceiling. Truncating
+eval generation at 4096 would silently hide the long `<think>` chains
+the CI accepts.
+
 ## Milestone strategy
 
 - **May 24 — model-running validation (10% of project grade).** The CI just
