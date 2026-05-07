@@ -32,3 +32,19 @@ def test_load_chat_template_returns_byte_identical_string():
     raw = CHAT_TEMPLATE.read_bytes()
     loaded = load_chat_template(CHAT_TEMPLATE)
     assert loaded.encode("utf-8") == raw
+
+
+def test_chat_template_has_no_generation_markers():
+    """We use ``assistant_only_loss=False`` because the locked Jinja lacks
+    ``{% generation %}`` markers — without them TRL 0.21+ refuses to
+    auto-patch the Qwen3 chat template (Stage 3 smoke run, 2026-05-07).
+
+    If a future team-coordinated update adds these markers to
+    ``emainelpe-shared``, this test will fail intentionally, prompting a
+    flip to ``assistant_only_loss=True`` in ``sft_config_kwargs`` and a
+    re-run of the cluster smoke.
+    """
+    template = load_chat_template(CHAT_TEMPLATE)
+    assert "{% generation %}" not in template
+    assert "{%- generation %}" not in template
+    assert "{%generation%}" not in template

@@ -160,9 +160,14 @@ produced in Stage 1, using the locked LoRA config.
   locked Jinja
 - Use `TRL.SFTTrainer` with `peft_config=LoraConfig(...)` and
   `processing_class=tokenizer`
-- `assistant_only_loss=True` (TRL auto-patches the Qwen3 chat template)
-- `packing=False` (the `<think>` blocks are long; packing breaks
-  assistant-only-loss masks)
+- `assistant_only_loss=False` — TRL 0.21+ refuses to auto-patch the
+  locked Qwen3 Jinja because it lacks `{% generation %}` markers
+  (discovered Stage 3 smoke run, 2026-05-07). Loss is computed over the
+  full sequence (user + assistant tokens). Adding the markers requires a
+  team-coordinated update to `emainelpe-shared` and is filed as a v2
+  stretch goal below.
+- `packing=False` (the `<think>` blocks are long; packing also rules
+  out a future flip back to assistant-only-loss without re-considering)
 - bf16 if supported, else fp16
 - Gradient checkpointing ON
 - CLI args for `--train_file`, `--eval_file`, `--output_dir`,
@@ -319,6 +324,15 @@ options only if the main path lands ahead of schedule.
 - **Generation config sweep.** Run a 50-sample temperature sweep
   (0.1 / 0.3 / 0.6) on the clean eval before committing the final
   generation_config to the checkpoint pushed for June 7.
+- **Assistant-only loss masking.** Add `{% generation %}` markers to
+  `chat_template/chat_template.jinja` so TRL's `SFTTrainer` can mask
+  non-assistant tokens out of the loss. Currently disabled because the
+  locked template lacks the markers (TRL 0.21+ refuses to auto-patch).
+  Requires a coordinated update to `emainelpe-shared` and re-verification
+  on all four experts. Marginal expected win on math accuracy; worth
+  ~1 day. If taken on, also flip `assistant_only_loss=True` in
+  `scripts/train_sft.py:sft_config_kwargs` and update the coupled
+  unit test in `scripts/tests/test_train_sft_io.py`.
 
 ---
 

@@ -2,9 +2,9 @@
 
 These lock the values that the merge in Phase 3 depends on (LoRA shape) and
 the values that CLAUDE.md commits us to (SFT schedule, batch sizes, packing
-off, assistant_only_loss on, max_length=4096). They run without peft/trl
-because the helpers return plain dicts; the actual LoraConfig / SFTConfig
-instantiation is exercised at runtime on RCP, not in unit tests.
+off, max_length=4096). They run without peft/trl because the helpers return
+plain dicts; the actual LoraConfig / SFTConfig instantiation is exercised
+at runtime on RCP, not in unit tests.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import datetime as dt
 from types import SimpleNamespace
 
 from scripts.train_sft import (
+    compute_warmup_steps,
     default_run_name,
     lora_config_kwargs,
     sft_config_kwargs,
@@ -48,6 +49,25 @@ def _default_args(**overrides):
     return SimpleNamespace(**base)
 
 
+def _call_sft(
+    *,
+    args=None,
+    yaml_dict=None,
+    precision="bf16",
+    run_name="sft-test",
+    use_wandb=False,
+    n_train_examples=50_000,
+):
+    return sft_config_kwargs(
+        args=args or _default_args(),
+        yaml_dict=yaml_dict or LOCKED_LORA_YAML,
+        precision=precision,
+        run_name=run_name,
+        use_wandb=use_wandb,
+        n_train_examples=n_train_examples,
+    )
+
+
 # ---- lora_config_kwargs ----------------------------------------------------
 
 def test_lora_config_kwargs_locks_rank_alpha_dropout_bias_tasktype():
@@ -81,73 +101,54 @@ def test_lora_config_kwargs_renames_alpha_to_lora_alpha():
 # ---- sft_config_kwargs -----------------------------------------------------
 
 def test_sft_config_kwargs_uses_locked_max_seq_length():
-    kw = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
-        run_name="sft-test",
-        use_wandb=False,
-    )
-    assert kw["max_length"] == 4096
+    assert _call_sft()["max_length"] == 4096
 
 
-def test_sft_config_kwargs_disables_packing_and_enables_assistant_only_loss():
-    kw = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
-        run_name="sft-test",
-        use_wandb=False,
-    )
+def test_sft_config_kwargs_disables_packing_and_assistant_only_loss():
+    """Both off. assistant_only_loss=False is forced because the locked
+    Jinja lacks `{% generation %}` markers (TRL 0.21+ refuses to auto-patch).
+    A flip back to True must be coupled with adding generation markers
+    in emainelpe-shared and a re-run of the cluster smoke."""
+    kw = _call_sft()
     assert kw["packing"] is False
-    assert kw["assistant_only_loss"] is True
+    assert kw["assistant_only_loss"] is False
 
 
-def test_sft_config_kwargs_uses_cosine_schedule_with_warmup():
-    kw = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
-        run_name="sft-test",
-        use_wandb=False,
-    )
-    assert kw["lr_scheduler_type"] == "cosine"
-    assert kw["warmup_ratio"] == 0.03
+def test_sft_config_kwargs_uses_cosine_schedule():
+    assert _call_sft()["lr_scheduler_type"] == "cosine"
+
+
+def test_sft_config_kwargs_warmup_steps_is_three_percent_of_total():
+    """50k examples, batch 4×8=32, 2 epochs → ceil(50000/32)*2 = 3126 total
+    steps → round(0.03*3126) = 94 warmup steps."""
+    kw = _call_sft(n_train_examples=50_000)
+    assert kw["warmup_steps"] == 94
+    assert "warmup_ratio" not in kw
+
+
+def test_sft_config_kwargs_warmup_steps_floor_is_one_for_smoke():
+    """200 examples, 1 epoch → 7 total steps → round(0.21) = 0 → floor to 1.
+    Without the floor, SFTConfig refuses warmup_steps=0 in some versions."""
+    smoke_args = _default_args(epochs=1)
+    kw = _call_sft(args=smoke_args, n_train_examples=200)
+    assert kw["warmup_steps"] == 1
 
 
 def test_sft_config_kwargs_enables_gradient_checkpointing_non_reentrant():
-    kw = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
-        run_name="sft-test",
-        use_wandb=False,
-    )
+    kw = _call_sft()
     assert kw["gradient_checkpointing"] is True
     assert kw["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
 
 
 def test_sft_config_kwargs_bf16_vs_fp16_flags():
-    bf16 = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
-        run_name="sft-test",
-        use_wandb=False,
-    )
-    fp16 = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="fp16",
-        run_name="sft-test",
-        use_wandb=False,
-    )
+    bf16 = _call_sft(precision="bf16")
+    fp16 = _call_sft(precision="fp16")
     assert bf16["bf16"] is True and bf16["fp16"] is False
     assert fp16["bf16"] is False and fp16["fp16"] is True
 
 
 def test_sft_config_kwargs_passes_through_cli_overrides():
-    kw = sft_config_kwargs(
+    kw = _call_sft(
         args=_default_args(
             epochs=1,
             learning_rate=5e-5,
@@ -156,10 +157,7 @@ def test_sft_config_kwargs_passes_through_cli_overrides():
             seed=7,
             output_dir="/tmp/runX",
         ),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
         run_name="sft-override",
-        use_wandb=False,
     )
     assert kw["num_train_epochs"] == 1
     assert kw["learning_rate"] == 5e-5
@@ -171,13 +169,7 @@ def test_sft_config_kwargs_passes_through_cli_overrides():
 
 
 def test_sft_config_kwargs_save_and_eval_cadence():
-    kw = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
-        run_name="sft-test",
-        use_wandb=False,
-    )
+    kw = _call_sft()
     assert kw["save_strategy"] == "steps"
     assert kw["save_steps"] == 500
     assert kw["eval_strategy"] == "steps"
@@ -186,22 +178,66 @@ def test_sft_config_kwargs_save_and_eval_cadence():
 
 
 def test_sft_config_kwargs_report_to_follows_use_wandb():
-    on = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
-        run_name="sft-test",
-        use_wandb=True,
+    assert _call_sft(use_wandb=True)["report_to"] == "wandb"
+    assert _call_sft(use_wandb=False)["report_to"] == "none"
+
+
+# ---- compute_warmup_steps --------------------------------------------------
+
+def test_compute_warmup_steps_full_run_50k_two_epochs():
+    """Anchor case from CLAUDE.md: 50k train, batch 32, 2 epochs."""
+    n = compute_warmup_steps(
+        n_train_examples=50_000,
+        per_device_batch_size=4,
+        gradient_accumulation_steps=8,
+        epochs=2,
     )
-    off = sft_config_kwargs(
-        args=_default_args(),
-        yaml_dict=LOCKED_LORA_YAML,
-        precision="bf16",
-        run_name="sft-test",
-        use_wandb=False,
+    assert n == 94
+
+
+def test_compute_warmup_steps_smoke_run_floors_to_one():
+    """Smoke: 200 train, 1 epoch → 7 total steps → 0.21 → 0 → floor."""
+    n = compute_warmup_steps(
+        n_train_examples=200,
+        per_device_batch_size=4,
+        gradient_accumulation_steps=8,
+        epochs=1,
     )
-    assert on["report_to"] == "wandb"
-    assert off["report_to"] == "none"
+    assert n == 1
+
+
+def test_compute_warmup_steps_factors_epochs_into_total_steps():
+    """Warmup is rounded once from total_steps = ceil(n/batch) * epochs,
+    not multiplied per-epoch. ceil(10000/32) = 313 steps_per_epoch.
+        1 ep: total=313,  round(0.03*313)  = round(9.39)  = 9
+        3 ep: total=939,  round(0.03*939)  = round(28.17) = 28
+    (28 != 3*9 because rounding doesn't distribute — that's the point.)"""
+    one_ep = compute_warmup_steps(
+        n_train_examples=10_000,
+        per_device_batch_size=4,
+        gradient_accumulation_steps=8,
+        epochs=1,
+    )
+    three_ep = compute_warmup_steps(
+        n_train_examples=10_000,
+        per_device_batch_size=4,
+        gradient_accumulation_steps=8,
+        epochs=3,
+    )
+    assert one_ep == 9
+    assert three_ep == 28
+
+
+def test_compute_warmup_steps_respects_custom_ratio():
+    n = compute_warmup_steps(
+        n_train_examples=10_000,
+        per_device_batch_size=4,
+        gradient_accumulation_steps=8,
+        epochs=1,
+        warmup_ratio=0.10,
+    )
+    # ceil(10000/32) = 313; round(0.10*313) = 31
+    assert n == 31
 
 
 # ---- default_run_name ------------------------------------------------------

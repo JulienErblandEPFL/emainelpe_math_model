@@ -59,6 +59,26 @@ def default_run_name(
     return f"sft-{when.strftime('%Y%m%d-%H%M')}-{epochs}ep-r{rank}"
 
 
+def compute_warmup_steps(
+    *,
+    n_train_examples: int,
+    per_device_batch_size: int,
+    gradient_accumulation_steps: int,
+    epochs: int,
+    warmup_ratio: float = 0.03,
+) -> int:
+    """Total training steps × ``warmup_ratio``, rounded, with a floor of 1.
+
+    Replaces ``SFTConfig.warmup_ratio`` (deprecated in TRL 0.21+). Computed
+    once up-front from the post-filter train size; the smoke run on 200
+    examples produces ``total_steps=7`` so the ``max(1, ...)`` floor matters.
+    """
+    import math
+    effective_batch = per_device_batch_size * gradient_accumulation_steps
+    total_steps = math.ceil(n_train_examples / effective_batch) * epochs
+    return max(1, round(warmup_ratio * total_steps))
+
+
 def lora_config_kwargs(yaml_dict: dict) -> dict:
     """Map locked ``lora.yaml`` keys → ``peft.LoraConfig`` kwargs.
 
@@ -114,16 +134,30 @@ def sft_config_kwargs(
     precision: str,
     run_name: str,
     use_wandb: bool,
+    n_train_examples: int,
 ) -> dict:
-    """Map CLI args + locked yaml + dtype → ``trl.SFTConfig`` kwargs.
+    """Map CLI args + locked yaml + dtype + train-set size → ``trl.SFTConfig``
+    kwargs.
 
-    Note on eval_strategy/eval_steps: these measure token-level cross-entropy
-    on a held-out slice of the SAME training distribution. They DO NOT
-    measure math accuracy. Math accuracy lives in Stage 4
-    (scripts/eval_local.py). A flat eval-loss curve does not necessarily
-    mean the model has stopped improving on math; conversely, a falling
-    eval-loss curve does not guarantee pass@1 went up.
+    Loss-masking note: ``assistant_only_loss=False`` because the locked Jinja
+    in ``chat_template/chat_template.jinja`` lacks ``{% generation %}``
+    markers and TRL 0.21+ refuses to auto-patch the Qwen3 template without
+    them. We compute loss over the full sequence (user + assistant tokens).
+    Adding the markers is a v2 stretch goal — see IMPLEMENTATION_PLAN.md.
+
+    Eval-strategy note: ``eval_steps`` measures token-level cross-entropy
+    on a held-out slice of the SAME training distribution. It does NOT
+    measure math accuracy — that lives in Stage 4 (scripts/eval_local.py).
+    A flat eval-loss curve does not necessarily mean the model has stopped
+    improving on math; a falling eval-loss curve does not guarantee
+    pass@1 went up.
     """
+    warmup_steps = compute_warmup_steps(
+        n_train_examples=n_train_examples,
+        per_device_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        epochs=args.epochs,
+    )
     return {
         "output_dir": str(args.output_dir),
         "num_train_epochs": args.epochs,
@@ -131,10 +165,10 @@ def sft_config_kwargs(
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "lr_scheduler_type": "cosine",
-        "warmup_ratio": 0.03,
+        "warmup_steps": warmup_steps,
         "max_length": yaml_dict["max_seq_length"],
         "packing": False,
-        "assistant_only_loss": True,
+        "assistant_only_loss": False,
         "bf16": precision == "bf16",
         "fp16": precision == "fp16",
         "gradient_checkpointing": True,
@@ -307,7 +341,7 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("loading model from %s (dtype=%s)", base_model, dtype)
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map="auto",
     )
     model.gradient_checkpointing_enable()
@@ -350,6 +384,7 @@ def main(argv: list[str] | None = None) -> None:
         precision=precision,
         run_name=run_name,
         use_wandb=use_wandb,
+        n_train_examples=len(train_ds),
     ))
 
     trainer = SFTTrainer(

@@ -64,6 +64,7 @@ Then in week 4 (team work, not part of this repo): DARE → AdaMerging merge.
 | LR schedule | Cosine, 3% warmup | Standard |
 | Gradient checkpointing | ON | Memory headroom |
 | Thinking mode | ON, baked into chat template | CI does NOT pass enable_thinking |
+| Loss masking | Full sequence (no assistant-only mask) | Stage 3 smoke (2026-05-07): TRL 0.21+ refused to auto-patch the locked Jinja because it lacks `{% generation %}` markers. Adding markers is a v2 stretch (requires emainelpe-shared coordination) |
 | RLVR verifier | Exact-match | Proposal commitment; SymPy is v2 stretch |
 
 ## Locked shared files
