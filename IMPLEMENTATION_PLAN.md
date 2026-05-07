@@ -107,6 +107,14 @@ ready for TRL's `SFTTrainer`.
   strip_trailing_preamble → min_reasoning_chars. The strip runs BEFORE
   the length floor so cleaned reasoning is what gets measured.
 
+**Verified on RCP (2026-05-07).** Full DART-Math-Uniform dry run:
+kept=282402, dropped_no_box=307133, dropped_too_long=395,
+dropped_too_short_reasoning=770, dropped_too_long_answer=5.
+Strip-rate `[prepare_sft]` diagnostic: 94.8% (268448/283172 rows
+reaching the strip step). Spot-check of 5 random surviving rows: 4/5
+perfectly clean, 1/5 with a tiny inert cosmetic artifact (orphan
+"The"). The 94.8% is the real measured rate, not an estimate.
+
 ---
 
 ## Stage 2 — Local chat-template verification
@@ -318,8 +326,8 @@ options only if the main path lands ahead of schedule.
 
 ```
 Stage 0 — Repo skeleton:                 DONE (2026-05-05)
-Stage 1 — Data preparation:              NOT STARTED
-Stage 2 — Chat-template verification:    NOT STARTED
+Stage 1 — Data preparation:              DONE (2026-05-07)
+Stage 2 — Chat-template verification:    DONE (2026-05-07)
 Stage 3 — SFT training script:           NOT STARTED
 Stage 4 — Local eval:                    NOT STARTED
 Stage 5 — Merge and push:                NOT STARTED
