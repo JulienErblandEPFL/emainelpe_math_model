@@ -403,6 +403,6 @@ Stage 2 — Chat-template verification:    DONE (2026-05-07)
 Stage 3 — SFT training script:           DONE (2026-05-07)
 Stage 4 — Local eval:                    DONE (2026-05-07)
 Stage 5 — Merge and push:                NOT STARTED
-Stage 6 — RCP submission script:         NOT STARTED
+Stage 6 — RCP submission script:         DONE (2026-05-08)
 Stage 7 — RLVR:                          DEFERRED
 ```
