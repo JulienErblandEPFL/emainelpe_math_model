@@ -115,6 +115,82 @@ reaching the strip step). Spot-check of 5 random surviving rows: 4/5
 perfectly clean, 1/5 with a tiny inert cosmetic artifact (orphan
 "The"). The 94.8% is the real measured rate, not an estimate.
 
+### v2 (mixed DART + OpenMathInstruct-2) — implemented 2026-05-09
+
+**Goal.** A second dataset variant that adds `nvidia/OpenMathInstruct-2`
+(OMI2) as a parallel source to DART-Math-Uniform. Final v2 size matches
+v1 (~50k examples) at ~50/50 mix.
+
+**Why mix, not replace.** OMI2's teacher (Llama3.1-405B-Instruct) is
+substantially stronger than DART's (DeepSeekMath-7B-RL) — that's the
+core motivation for adding it. DART contributes diversity and per-
+problem multi-solution coverage that OMI2's augmented variants don't
+match cleanly. Mixing keeps both signals.
+
+**Locked decisions (D1–D5).**
+
+| ID | Decision |
+|---|---|
+| D1 | **MIX, not REPLACE.** v2 = 50/50 split DART + OMI2, ~25k each, mixed and shuffled with seed=42. |
+| D2 | **OMI2 boxing strategy.** Append `\boxed{expected_answer}` to the cleaned `generated_solution`. `extract_last_boxed` takes the LAST box, so the appended answer wins; any mid-text `\boxed{}` in the model's CoT is preserved as reasoning. Same chat-format output as DART. |
+| D3 | **Per-source per-problem cap.** Max 4 solutions per unique `problem` string, applied INDEPENDENTLY to each source. Same DART rule, same `apply_per_question_cap`. |
+| D4 | **Token-length filter on formatted chat.** New step: drop rows whose Qwen3-tokenized formatted chat exceeds 3500 tokens. Auto-default for `--source openmathinstruct` and `--source mixed`; off for `--source dart` (preserves v1 byte-stable). The OpenMathInstruct-2 paper explicitly warns that "excessive verbosity is detrimental to SFT". |
+| D5 | **Subsample seed = 42.** Same as DART resampling; the mix is reproducible end-to-end. |
+
+**Architecture.** Additive to `data/prepare_sft.py`, no refactor of
+`build_pipeline`. The OMI2 path normalizes raw rows into the DART
+`{query, response}` shape via `normalize_openmathinstruct_row` (append
+the boxed answer), then feeds through the existing extract → strip →
+cap → format pipeline. The token filter is opt-in via two new kwargs
+(`max_formatted_tokens` + `tokenize_fn`); both default to `None` and the
+filter is a no-op unless both are set, so v1 callers and tests are
+unaffected.
+
+The `transformers.AutoTokenizer` import that backs the token filter
+lives in `main()` only, behind the `--max-formatted-tokens` resolution.
+CPU unit tests inject a fake `tokenize_fn` so the laptop suite stays
+under 0.1s.
+
+**Files changed.**
+- `data/prepare_sft.py` — new helpers `normalize_openmathinstruct_row`,
+  `resolve_n_samples`; new kwargs `max_formatted_tokens` + `tokenize_fn`
+  on `build_pipeline`; new CLI flags `--source`, `--train-size`,
+  `--max-formatted-tokens`, `--dart-fraction`, `--openmathinstruct-name`,
+  `--openmathinstruct-split`, `--chat-template`. Existing DART-only
+  defaults unchanged.
+- `data/tests/test_prepare_sft.py` — 20 new tests covering OMI2
+  normalization, the token filter (with mock `tokenize_fn`),
+  `resolve_n_samples` semantics, mixed-mode shuffle invariants.
+  Existing 36 v1 tests pass byte-stable.
+- `README.md` — new "Data prep" section documenting v1 (default) and
+  v2 (`--source mixed`) invocations.
+
+**Mutually exclusive CLI flags.**
+- `--n-samples X` (v1 semantics): X total rows after filtering, BEFORE
+  the train/eval split. The existing tests + the existing
+  `rcp/submit_train.sh` keep working unchanged.
+- `--train-size X` (v2 semantics): X rows in `train.jsonl` AFTER the
+  split. Internally translates to `n_samples = X + eval_size`.
+- Passing both → CLI error.
+
+**Done when.**
+- Existing DART tests pass byte-stable (✅ 36/36).
+- New v2 tests pass on the laptop in <0.1s (✅ 20/20).
+- An RCP dry run with `--source mixed` produces a non-empty
+  `data_out_v2/{train,eval}.jsonl` and the diagnostic logs show
+  per-source kept/dropped counts (operational; not yet done).
+
+**Not in v2 scope.**
+- No change to `scripts/train_sft.py` — the v2 JSONL is consumed exactly
+  like v1.
+- No new `--source` for RLVR. Stage 7's prompt-set curation still
+  reads from `data_out/train.jsonl` (DART-shaped); to feed v2 prompts
+  to RLVR, point `--input-jsonl` at `data_out_v2/train.jsonl` — same
+  schema.
+- No streaming-mode loader. OMI2 `train_1M` loads in full; ~1GB in
+  memory on RCP. Streaming would be cleaner but requires rework of
+  `build_pipeline` to consume an `IterableDataset`.
+
 ---
 
 ## Stage 2 — Local chat-template verification
@@ -232,11 +308,26 @@ parameters below are pinned to match the "Eval contract" section in
     pass@k metrics + per-problem detailed results (extracted answers,
     per-completion correctness flags).
   - stdout: one-line pass@1 / pass@8 summary.
-- Use vLLM with bf16. **`max_model_len` ≥ prompt(≤4096) + `max_new_tokens`(16384) ⇒ default 20480.** Runtime assertion in `main()`: refuse to run if `AutoConfig.from_pretrained(model).max_position_embeddings < max_model_len`.
+- Use vLLM with bf16. **Default (CI-faithful): `max_model_len=4096`,
+  `max_tokens=4096`** — matches the team README's combined-context
+  cap; the binding ceiling for any CI prediction. **`--no-ci-mode`
+  escape hatch: `max_model_len=20480`, `max_tokens=16384`** — tracks
+  the older `docs/project_description.pdf` (page 3: `Max new tokens:
+  16384`), more permissive than CI; numbers measured under it
+  *overstate* what CI will report. Use only for ablations where the
+  longer generation budget matters. See CLAUDE.md "Eval contract" for
+  the conflict write-up. Runtime assertion in `main()`: refuse to run
+  if `AutoConfig.from_pretrained(model).max_position_embeddings <
+  max_model_len`.
 - Apply chat template via `tokenizer.apply_chat_template(..., add_generation_prompt=True)` AFTER overwriting `tokenizer.chat_template` with the locked Jinja (same idiom as `scripts/verify_chat_template.py` and `scripts/train_sft.py:smoke_inference`). vLLM receives pre-rendered prompt strings.
 - SamplingParams:
   - **`n=8`** (CI contract)
-  - **`max_tokens=16384`** — eval-time `max_new_tokens`, NOT the training-time `max_seq_length=4096` from `lora.yaml`
+  - **`max_tokens`**: 4096 by default (CI-faithful, matches the team
+    README's `max_model_len=4096`); 16384 under `--no-ci-mode` (legacy,
+    tracks `docs/project_description.pdf` page 3, more permissive
+    than CI). NOT the training-time `max_seq_length=4096` from
+    `lora.yaml` — the training cap and the README's inference cap are
+    independent settings that happen to coincide at 4096.
   - **`seed=42`** (CI contract; same seed as data prep and SFT)
   - `temperature` / `top_p` / `top_k` default to the merged checkpoint's
     `generation_config.json` (set in Stage 5). Pre-Stage-5 fallback
@@ -252,14 +343,30 @@ parameters below are pinned to match the "Eval contract" section in
 **Done when.**
 - CPU unit tests for the pure helpers (prompt construction given a fake
   tokenizer, generations-dump JSONL shape, sampling-params override
-  warning, max_model_len assertion logic) pass on the user's laptop in
-  <5s without vLLM imports.
+  warning, max_model_len assertion logic, `resolve_context_caps` —
+  CI-faithful default + `--no-ci-mode` legacy escape hatch + explicit
+  overrides) pass on the user's laptop in <5s without vLLM imports.
 - The script runs on `validation_samples/math.jsonl` with bare
   `Qwen/Qwen3-1.7B` and produces non-trivial pass@1 (i.e., not 0% and
   not 100%).
 - `generations.jsonl` is well-formed: re-feeding it through
   `python -m evaluate.score --generations <file> --benchmark math`
   reproduces the script's reported metrics byte-for-byte.
+
+**Bar to claim "SFT added value" (post-Stage-3 checkpoint vs baseline).**
+The team README makes **pass@8 the headline metric for math** (free-form,
+graded on pass@8). The recorded bare-model numbers in `BASELINE.md`
+(pass@1 = 0.300, pass@8 = 0.400, 2026-05-07) were measured under the
+*legacy* 20480/16384 caps — more permissive than CI. They are a soft
+upper estimate of the true CI-faithful baseline; a re-baseline under
+the new default (`max_model_len=4096`, `max_tokens=4096`) is pending
+on RCP. Once it lands, the primary criterion to beat is **CI-mode
+pass@8 above the CI-mode bare baseline**. Until then, treat
+pass@8 = 0.400 as the soft floor with the caveat that it may drop
+under the 4096 cap (long `<think>` chains can clip). Report pass@1
+alongside as secondary signal — a pass@1 jump with flat pass@8 means
+the model became more consistent but isn't unlocking new problems;
+that's a useful diagnostic but isn't what the CI grades.
 
 **Noise budget on the default snapshot.** N=10 means the standard error
 on pass@1 is roughly ±5 percentage points; pass@8 is binary per problem
@@ -313,7 +420,12 @@ pass@1.
   required files at root: `config.json`, `generation_config.json`,
   `*.safetensors`, `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`
 - After the push, the course CI (running nightly at 23:59) re-evaluates
-  and posts an `EVAL_REPORT.md` PR
+  the checkpoint (freshness check passes because `lastModified` advanced)
+  and opens or updates an automatic Pull Request on the model repo's
+  Hugging Face Community tab, adding/replacing `EVAL_REPORT.md` at the
+  repo root. The PR is non-blocking — read it for debug, no need to
+  merge. See team project README → "Automatic evaluation reports" for
+  the canonical wording.
 
 **This stage produces the May 24 milestone deliverable.**
 
@@ -344,26 +456,100 @@ running Stages 1 → 3 → 5 in sequence.
 
 ---
 
-## Stage 7 — RLVR (Phase 2) — DEFERRED
+## Stage 7 — RLVR (Phase 2) — V0 IMPLEMENTED 2026-05-09, NOT YET TRAINED
 
 **Goal.** Add GRPO training on top of the SFT checkpoint.
 
-**Status when this is written.** Not started. Whether to do this at all
-depends on Stage 5 results. From `CLAUDE.md`:
+**Why we're doing this now.** Stage 5 SFT post-merge pass@8 on
+`validation_samples/math.jsonl` is 0.30 vs the bare-model baseline of
+0.40 (BASELINE.md). The SFT model produces correct format consistently
+but doesn't beat baseline on this small noisy set. RLVR is the team's
+committed lever to close that gap; from `CLAUDE.md`:
+
 > RLVR'd checkpoint if RLVR helps; SFT fallback if RLVR destabilizes
 > (Dang & Ngo 2025 warns this is a real risk on small models).
 
-**Decision criteria — assess after Stage 5 finishes:**
-- If SFT pass@8 on a held-out math eval is meaningfully below the
-  proposal target → try RLVR
-- If SFT pass@8 is already strong → consider skipping RLVR; spend the
-  June 7 budget on the merge phase and the report
-- If team timeline is tight → SFT-only is acceptable per the proposal
+**Decisions locked (2026-05-09):**
 
-**When this stage is taken on:** open a separate IMPLEMENTATION_PLAN_RLVR.md
-and break GRPO into its own stages (verifier, prompt set construction,
-GRPOTrainer config, eval-during-training). Do NOT inline RLVR into this
-plan; it's a substantial body of work and deserves its own context.
+| ID | Decision | Choice |
+|----|---|---|
+| D1 | RL framework | TRL `GRPOTrainer` (consistency with the SFT pipeline) |
+| D2 | Starting point | Continue training the SFT LoRA adapter on top of `Qwen3-1.7B` base (Phase 3-merge-compatible) |
+| D3 | Prompt set | Score DART-Math-Uniform with the SFT model; keep the [0.2, 0.8] empirical solve-rate band |
+| D4 | Reward | `reward = 1.0 * correct + 0.05 * has_box`, via `evaluate.is_equiv` |
+| D5 | Hyperparameters | lr=3e-6, beta(KL)=0.04, num_generations=8, rollout_temp=0.8, max_prompts=5000, max_new_tokens=4096, max_prompt_length=1024, per_device_batch=1, grad_accum=8, epochs=1, seed=42 |
+| Online eval | Eval-during-training? | No — manual post-training run of `scripts/eval_local.py`. W&B reward variance + KL trajectory are the in-flight diagnostics. |
+
+**Files implemented.**
+
+- `scripts/reward_fn.py` — `compute_reward(generation, gold) -> float`,
+  delegating to `evaluate.is_equiv`. Stays TRL-agnostic so it's
+  testable on the user's laptop.
+- `data/prepare_rlvr.py` — D3 prompt curation. Loads Stage 1 train
+  JSONL, runs n=8 rollouts at temp=0.8 via vLLM against the merged SFT
+  checkpoint, computes empirical solve rate, filters to
+  `[0.2, 0.8]`, writes `{prompt, answer, solve_rate}` JSONL.
+- `scripts/train_rlvr.py` — TRL `GRPOTrainer` driver. Loads base +
+  SFT adapter trainable (D2). P1 smoke + P2 reward-variance + P3 KL-
+  spike preflights. Saves trained adapter to `<output-dir>/final/`,
+  byte-compatible with `merge_and_push.py`.
+- `rcp/submit_rlvr.sh` — RCP submission script. Mirrors
+  `submit_train.sh`. New env vars: `ADAPTER_DIR`, `PROMPT_SET`,
+  `SFT_MODEL`, `MAX_PROMPTS`, `LEARNING_RATE`, `KL_COEF`,
+  `ROLLOUT_TEMP`, `SKIP_CURATION`, `SKIP_PREFLIGHTS`.
+
+**Critical preflights (enforced in `scripts/train_rlvr.py`).**
+
+- **P1.** Starting adapter must produce well-formed output (`<think>`,
+  `\boxed{}`). Smoke run before training. Abort on regression.
+- **P2.** Per-prompt reward variance must clear `0.01` on a 10-prompt
+  × 8-rollout sample. Without variance, GRPO advantage `(r-mean)/std`
+  is 0/0 and training is silent garbage. BASELINE.md flagged this as
+  a real risk for our checkpoint at low temperatures. Threshold and
+  preflight prompt count are CLI-overridable.
+- **P3.** KL divergence callback warns (does not abort) when KL > 0.5
+  in the first 100 optimizer steps — Dang & Ngo 2025 small-model
+  instability signal.
+
+**Tests (CPU-only, full suite passes in <1s on the user's laptop):**
+- `scripts/tests/test_reward_fn.py` — 10 tests covering the 4 input
+  combinations + `is_equiv` corner cases (`\frac{1}{2}` ↔ `0.5`, unit
+  stripping, last-box-wins).
+- `data/tests/test_prepare_rlvr.py` — 25 tests on `difficulty_filter`,
+  `extract_prompt_and_gold`, schema validation, JSONL round-trip,
+  CLI defaults.
+- `scripts/tests/test_train_rlvr.py` — 25 tests on D5 defaults,
+  prompt-set loading, P2 variance check (incl. boundary), P3 KL spike
+  helper (incl. window/threshold edges), `grpo_config_kwargs`,
+  `validate_max_new_tokens`.
+- `rcp/tests/test_submit_rlvr.py` — 11 tests on placeholder
+  rejection, dry-run pipeline composition, `SKIP_CURATION` /
+  `SKIP_PREFLIGHTS` env-var routing, token masking.
+
+**v0 → v1 transition criterion.** First RCP run lands cleanly through
+P1+P2 preflights, training completes without KL spike alerts, and the
+post-train smoke output still emits `<think>`+`\boxed{}`. Eval the
+saved adapter via Stage 4 against `validation_samples/math.jsonl`
+(default snapshot) AND `data_out/eval.jsonl` (lower-variance DART
+held-out slice). RLVR adds value when **CI-mode pass@8 on
+validation_samples** rises above the post-Stage-5 SFT pass@8 (0.30
+under the legacy 20480/16384 caps; the CI-faithful re-baseline is
+pending and may be lower).
+
+**Done when.**
+- v0 implementation passes the CPU test suite (✅ 2026-05-09).
+- A first RCP dry-run completes the curation pass and produces a
+  non-empty `rlvr_prompts.jsonl` (operational; not done yet).
+- A first RCP training run clears P1+P2 preflights and saves a
+  `final/` adapter without KL spike alerts (operational; not done yet).
+
+**Uncertainty disclosure.** RLVR on small models is genuinely fragile.
+The conservative defaults (low LR, modest prompt set, KL floor at
+0.04) are a starting point, not a recipe for guaranteed gains. The
+user should expect to iterate on hyperparameters multiple times before
+a stable run lands. v0 explicitly does NOT include: SymPy/hybrid
+verifier (still v2 stretch), DPO, multi-stage RL curriculum, reward
+model training. Eval-during-training is also out of scope at v0.
 
 ---
 
@@ -404,5 +590,5 @@ Stage 3 — SFT training script:           DONE (2026-05-07)
 Stage 4 — Local eval:                    DONE (2026-05-07)
 Stage 5 — Merge and push:                NOT STARTED
 Stage 6 — RCP submission script:         DONE (2026-05-08)
-Stage 7 — RLVR:                          DEFERRED
+Stage 7 — RLVR:                          V0 IMPLEMENTED 2026-05-09 (NOT YET TRAINED)
 ```

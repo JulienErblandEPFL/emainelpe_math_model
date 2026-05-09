@@ -29,15 +29,20 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.eval_local import (
+    CI_MAX_MODEL_LEN,
+    CI_MAX_NEW_TOKENS,
     FALLBACK_TEMPERATURE,
     FALLBACK_TOP_K,
     FALLBACK_TOP_P,
+    LEGACY_MAX_MODEL_LEN,
+    LEGACY_MAX_NEW_TOKENS,
     _check_max_model_len,
     build_generations_dump,
     format_summary,
     load_eval_jsonl,
     load_generation_config_from_model_dir,
     normalize_input_row,
+    resolve_context_caps,
     resolve_sampling_params,
     write_generations_jsonl,
 )
@@ -240,6 +245,72 @@ def test_check_max_model_len_error_mentions_both_numbers():
     msg = str(exc.value)
     assert "4096" in msg
     assert "20480" in msg
+
+
+# =============================================================================
+# resolve_context_caps
+# =============================================================================
+
+def test_resolve_context_caps_no_args_returns_ci_caps():
+    """No flags, no overrides → CI-faithful 4096 / 4096. This is the
+    headline default-flip: a fresh ``python scripts/eval_local.py``
+    invocation is now calibrated against what CI will see, not the
+    legacy permissive 20480/16384."""
+    mml, mnt = resolve_context_caps()
+    assert mml == CI_MAX_MODEL_LEN == 4096
+    assert mnt == CI_MAX_NEW_TOKENS == 4096
+
+
+def test_resolve_context_caps_default_mode_is_ci():
+    """Explicit ``legacy_mode=False`` (the default), no overrides:
+    matches the README's combined max_model_len cap."""
+    mml, mnt = resolve_context_caps(
+        legacy_mode=False, max_model_len_arg=None, max_new_tokens_arg=None
+    )
+    assert mml == CI_MAX_MODEL_LEN == 4096
+    assert mnt == CI_MAX_NEW_TOKENS == 4096
+
+
+def test_resolve_context_caps_legacy_mode():
+    """--no-ci-mode (legacy escape hatch): 20480 / 16384. Tracks
+    docs/project_description.pdf page 3 (max_new_tokens=16384)."""
+    mml, mnt = resolve_context_caps(
+        legacy_mode=True, max_model_len_arg=None, max_new_tokens_arg=None
+    )
+    assert mml == LEGACY_MAX_MODEL_LEN == 20480
+    assert mnt == LEGACY_MAX_NEW_TOKENS == 16384
+
+
+def test_resolve_context_caps_explicit_max_model_len_wins_in_ci_mode():
+    mml, mnt = resolve_context_caps(
+        legacy_mode=False, max_model_len_arg=8192, max_new_tokens_arg=None
+    )
+    assert mml == 8192
+    assert mnt == CI_MAX_NEW_TOKENS
+
+
+def test_resolve_context_caps_explicit_max_new_tokens_wins_in_ci_mode():
+    mml, mnt = resolve_context_caps(
+        legacy_mode=False, max_model_len_arg=None, max_new_tokens_arg=2048
+    )
+    assert mml == CI_MAX_MODEL_LEN
+    assert mnt == 2048
+
+
+def test_resolve_context_caps_explicit_overrides_apply_in_legacy_mode():
+    mml, mnt = resolve_context_caps(
+        legacy_mode=True, max_model_len_arg=10000, max_new_tokens_arg=8000
+    )
+    assert mml == 10000
+    assert mnt == 8000
+
+
+def test_resolve_context_caps_independent_overrides():
+    """Overriding one cap must not affect the resolution of the other."""
+    mml, mnt = resolve_context_caps(
+        legacy_mode=False, max_model_len_arg=10000, max_new_tokens_arg=8000
+    )
+    assert (mml, mnt) == (10000, 8000)
 
 
 # =============================================================================

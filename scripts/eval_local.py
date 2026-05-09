@@ -12,8 +12,27 @@ are CPU-testable. Heavy imports (``torch`` / ``transformers`` / ``vllm``)
 are deferred into ``main()`` and the runtime helpers so unit tests don't
 pull those wheels.
 
-CI contract values (n=8, max_tokens=16384, seed=42) are pinned. Sampling
-defaults are three-tiered (highest priority first):
+CI contract values (n=8, seed=42) are pinned. Context caps are
+two-mode:
+
+  - **Default (CI-faithful)**: max_model_len=4096, max_tokens=4096.
+    Matches the team project README's "Max model length 4096"
+    (combined prompt + generation). This is the binding ceiling for
+    any CI prediction; local pass@1 / pass@8 measured here are
+    calibrated against what CI will see.
+  - **--no-ci-mode (legacy escape hatch)**: max_model_len=20480,
+    max_tokens=16384. Mirrors ``docs/project_description.pdf`` page 3
+    (``Max new tokens: 16384``), the older course doc. More permissive
+    than the CI; numbers measured under it *overstate* CI scores. Use
+    only for ablations where the longer generation budget matters
+    (e.g., probing whether the model would have boxed an answer given
+    more tokens).
+
+Explicit ``--max-model-len`` / ``--max-new-tokens`` always override the
+mode-derived defaults. See CLAUDE.md "Eval contract" for the
+README-vs-project_description.pdf conflict write-up.
+
+Sampling defaults are three-tiered (highest priority first):
 
   1. CLI flags — ``--temperature`` / ``--top-p`` / ``--top-k`` if set.
      Each override is logged at WARNING.
@@ -60,12 +79,20 @@ FALLBACK_TEMPERATURE = 0.3
 FALLBACK_TOP_P = 0.95
 FALLBACK_TOP_K = 20
 
-# vLLM context defaults. max_model_len = max prompt (4096) + max_new_tokens (16384).
-DEFAULT_MAX_MODEL_LEN = 20480
+# vLLM context-window defaults. Two modes; see module docstring.
+#  - Default (CI-faithful): tracks the team project README's
+#    max_model_len=4096 cap. max_tokens budget shrinks to whatever fits
+#    within 4096 minus the rendered prompt; we set max_tokens=4096 and
+#    let vLLM clamp.
+#  - --no-ci-mode (legacy escape hatch): tracks
+#    docs/project_description.pdf page 3 (max_new_tokens=16384).
+#    max_model_len sized to fit prompt(≤4096) + max_new_tokens(16384).
+CI_MAX_MODEL_LEN = 4096
+CI_MAX_NEW_TOKENS = 4096
+LEGACY_MAX_MODEL_LEN = 20480
+LEGACY_MAX_NEW_TOKENS = 16384
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
 
-# CI-contract values; CLI-overridable but defaults are the contract.
-DEFAULT_MAX_NEW_TOKENS = 16384
 DEFAULT_N = 8
 DEFAULT_SEED = 42
 
@@ -264,6 +291,39 @@ def resolve_sampling_params(
     return final
 
 
+def resolve_context_caps(
+    *,
+    legacy_mode: bool = False,
+    max_model_len_arg: int | None = None,
+    max_new_tokens_arg: int | None = None,
+) -> tuple[int, int]:
+    """Resolve ``(max_model_len, max_new_tokens)`` from CLI args.
+
+    Two-source resolution (highest priority first):
+
+    1. Explicit ``--max-model-len`` / ``--max-new-tokens`` if the user
+       passed them.
+    2. Mode-derived defaults: 20480/16384 under ``legacy_mode=True``
+       (i.e., when ``--no-ci-mode`` is passed at the CLI), 4096/4096
+       otherwise. The CI-faithful 4096/4096 is the *default* —
+       calling this helper with no flags returns CI caps.
+
+    The explicit overrides exist so an operator can run an ablation
+    (e.g., ``--max-new-tokens 8192`` while staying in CI mode) without
+    juggling two flags. Each override is independent — passing one does
+    not affect the resolution of the other.
+    """
+    if legacy_mode:
+        default_mml = LEGACY_MAX_MODEL_LEN
+        default_mnt = LEGACY_MAX_NEW_TOKENS
+    else:
+        default_mml = CI_MAX_MODEL_LEN
+        default_mnt = CI_MAX_NEW_TOKENS
+    final_mml = max_model_len_arg if max_model_len_arg is not None else default_mml
+    final_mnt = max_new_tokens_arg if max_new_tokens_arg is not None else default_mnt
+    return final_mml, final_mnt
+
+
 def _check_max_model_len(positional_ceiling: int, max_model_len: int) -> None:
     """Refuse to launch if the model can't support the requested context.
 
@@ -399,9 +459,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Locked chat-template Jinja. Default: chat_template/chat_template.jinja.",
     )
     p.add_argument(
-        "--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN,
-        help=f"vLLM context window. Default: {DEFAULT_MAX_MODEL_LEN} "
-             f"(prompt cap 4096 + max_new_tokens 16384).",
+        "--no-ci-mode", action="store_true", dest="no_ci_mode",
+        help=(
+            "Drop the CI-faithful default and use the legacy permissive "
+            f"caps instead: max_model_len={LEGACY_MAX_MODEL_LEN}, "
+            f"max_tokens={LEGACY_MAX_NEW_TOKENS}. The CI-faithful default "
+            f"is max_model_len={CI_MAX_MODEL_LEN}, max_tokens={CI_MAX_NEW_TOKENS} "
+            "(matches the team project README's combined-context cap). "
+            "Use --no-ci-mode only for ablations where the longer "
+            "generation budget matters; numbers measured under it "
+            "*overstate* CI scores."
+        ),
+    )
+    p.add_argument(
+        "--max-model-len", type=int, default=None,
+        help=(
+            f"vLLM context window. Overrides the mode-derived default "
+            f"({CI_MAX_MODEL_LEN} CI-faithful, {LEGACY_MAX_MODEL_LEN} legacy)."
+        ),
     )
     p.add_argument(
         "--gpu-memory-utilization", type=float,
@@ -413,8 +488,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Completions per problem (CI contract: {DEFAULT_N}).",
     )
     p.add_argument(
-        "--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
-        help=f"vLLM SamplingParams.max_tokens (CI contract: {DEFAULT_MAX_NEW_TOKENS}).",
+        "--max-new-tokens", type=int, default=None,
+        help=(
+            f"vLLM SamplingParams.max_tokens. Overrides the mode-derived "
+            f"default ({CI_MAX_NEW_TOKENS} CI-faithful, "
+            f"{LEGACY_MAX_NEW_TOKENS} legacy)."
+        ),
     )
     p.add_argument(
         "--seed", type=int, default=DEFAULT_SEED,
@@ -449,6 +528,18 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 0. Resolve context caps from --no-ci-mode / explicit overrides.
+    args.max_model_len, args.max_new_tokens = resolve_context_caps(
+        legacy_mode=args.no_ci_mode,
+        max_model_len_arg=args.max_model_len,
+        max_new_tokens_arg=args.max_new_tokens,
+    )
+    mode_label = "legacy" if args.no_ci_mode else "ci-faithful"
+    logger.info(
+        "context caps: max_model_len=%d, max_new_tokens=%d (mode=%s)",
+        args.max_model_len, args.max_new_tokens, mode_label,
+    )
 
     # 1. Load + normalize input.
     raw_rows = load_eval_jsonl(args.eval_file)

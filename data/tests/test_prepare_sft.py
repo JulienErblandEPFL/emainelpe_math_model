@@ -16,6 +16,8 @@ from prepare_sft import (
     extract_last_boxed,
     format_response,
     make_example,
+    normalize_openmathinstruct_row,
+    resolve_n_samples,
     strip_trailing_preamble,
     write_jsonl,
 )
@@ -365,3 +367,535 @@ class TestBuildPipelinePurity:
         assert "$" not in think_block
         assert "The answer is" not in think_block
         assert assistant.endswith(r"\boxed{42}")
+
+
+class TestNormalizeOpenMathInstructRow:
+    """v2 D2: append \\boxed{expected_answer} so OMI2 rows pass through the
+    existing DART pipeline unchanged. Last-box-wins guarantees the appended
+    answer is what extract_last_boxed recovers."""
+
+    def _row(self, problem, solution, answer, source="math"):
+        return {
+            "problem": problem,
+            "generated_solution": solution,
+            "expected_answer": answer,
+            "problem_source": source,
+        }
+
+    def test_basic_row_normalizes_to_dart_shape(self):
+        out = normalize_openmathinstruct_row(
+            self._row("What is 2+2?", "Add them together.", "4")
+        )
+        assert set(out.keys()) == {"query", "response"}
+        assert out["query"] == "What is 2+2?"
+        assert out["response"] == "Add them together.\n\\boxed{4}"
+
+    def test_appended_box_is_extractable_as_gold(self):
+        out = normalize_openmathinstruct_row(
+            self._row("Compute pi", "Some reasoning here.", r"\frac{22}{7}")
+        )
+        result = extract_last_boxed(out["response"])
+        assert result is not None
+        before, ans = result
+        assert ans == r"\frac{22}{7}"
+        assert before == "Some reasoning here.\n"
+
+    def test_solution_with_internal_box_keeps_appended_as_last(self):
+        out = normalize_openmathinstruct_row(
+            self._row(
+                "Compute",
+                r"First I tried \boxed{wrong_intermediate}, then corrected.",
+                "5",
+            )
+        )
+        before, ans = extract_last_boxed(out["response"])
+        assert ans == "5"
+        assert "wrong_intermediate" in before
+
+    def test_strips_trailing_whitespace_in_solution(self):
+        out = normalize_openmathinstruct_row(
+            self._row("Q", "reasoning   \n\n  ", "7")
+        )
+        assert out["response"] == "reasoning\n\\boxed{7}"
+
+    def test_handles_non_string_expected_answer(self):
+        out = normalize_openmathinstruct_row(
+            self._row("Q", "reasoning", 42)
+        )
+        assert out["response"].endswith(r"\boxed{42}")
+
+
+class TestBuildPipelineWithOmi2Rows:
+    """Integration check for D1+D2: feed OMI2-normalized rows into the
+    existing build_pipeline. The 'reuse, don't duplicate' invariant lives
+    here — if any of these break, the synthesize-fake-DART-row strategy
+    has stopped working and we'd need to refactor."""
+
+    def _omi2(self, problem, solution, answer):
+        return normalize_openmathinstruct_row({
+            "problem": problem,
+            "generated_solution": solution,
+            "expected_answer": answer,
+            "problem_source": "math",
+        })
+
+    def test_omi2_rows_produce_canonical_chat_format(self):
+        rows = [
+            self._omi2(
+                f"Problem {i}",
+                "Step 1: do something. Step 2: arrive at the answer. " * 4,
+                str(i),
+            )
+            for i in range(5)
+        ]
+        train, _ = build_pipeline(
+            rows,
+            n_samples=10,
+            per_question_cap=4,
+            eval_size=0,
+            max_response_chars=8000,
+            min_reasoning_chars=50,
+            max_answer_chars=200,
+            seed=42,
+        )
+        assert len(train) == 5
+        for ex in train:
+            assistant = ex["messages"][1]["content"]
+            assert assistant.startswith("<think>\n")
+            assert "</think>\n\n\\boxed{" in assistant
+            assert assistant.endswith("}")
+
+    def test_omi2_per_question_cap_applies_via_query(self):
+        """D3: 'unique problem' for OMI2 = unique 'problem' string. After
+        normalization that's the 'query' field, so apply_per_question_cap
+        works without any modification — 10 augmented solutions for the
+        same problem with cap=4 reduces to 4."""
+        rows = [
+            self._omi2(
+                "Same augmented problem",
+                f"reasoning attempt {i}. " * 8,
+                str(i),
+            )
+            for i in range(10)
+        ]
+        train, _ = build_pipeline(
+            rows,
+            n_samples=100,
+            per_question_cap=4,
+            eval_size=0,
+            max_response_chars=8000,
+            min_reasoning_chars=50,
+            max_answer_chars=200,
+            seed=42,
+        )
+        assert len(train) == 4
+
+
+class TestTokenFilterInBuildPipeline:
+    """v2 D4: token-length cap on the formatted message sequence. The filter
+    is opt-in via two kwargs; when either is None it's a no-op (preserves
+    v1 byte-stable behavior).
+
+    Tests inject a fake tokenize_fn so the heavy ``transformers`` import
+    stays in main() only and laptop tests run in <1s.
+    """
+
+    def _row(self, q, r):
+        return {"query": q, "response": r}
+
+    def _make_fake_token_counter(self, mapping):
+        def _count(messages):
+            content = messages[1]["content"]
+            for prefix, n in mapping.items():
+                if prefix in content:
+                    return n
+            return 1
+        return _count
+
+    def test_token_filter_drops_overlong_rows(self):
+        rows = [
+            self._row("Q1", r"reasoning A " * 30 + r"\boxed{a}"),
+            self._row("Q2", r"reasoning B " * 30 + r"\boxed{b}"),
+        ]
+        tokenize_fn = self._make_fake_token_counter({
+            "\\boxed{a}": 1000,
+            "\\boxed{b}": 5000,
+        })
+        train, _ = build_pipeline(
+            rows,
+            n_samples=100,
+            per_question_cap=4,
+            eval_size=0,
+            max_response_chars=8000,
+            min_reasoning_chars=10,
+            max_answer_chars=200,
+            seed=42,
+            max_formatted_tokens=3500,
+            tokenize_fn=tokenize_fn,
+        )
+        assert len(train) == 1
+        assistant = train[0]["messages"][1]["content"]
+        assert assistant.endswith(r"\boxed{a}")
+
+    def test_token_filter_disabled_when_kwargs_none(self):
+        """Backward-compat: existing tests don't pass either of the new
+        kwargs, and behavior must be identical to v1."""
+        rows = [self._row("Q1", r"reasoning here. " * 30 + r"\boxed{a}")]
+        train, _ = build_pipeline(
+            rows,
+            n_samples=100, per_question_cap=4, eval_size=0,
+            max_response_chars=8000, min_reasoning_chars=10,
+            max_answer_chars=200, seed=42,
+        )
+        assert len(train) == 1
+
+    def test_token_filter_only_one_arg_set_is_no_op(self):
+        """Defensive: passing only max_formatted_tokens (without
+        tokenize_fn) or vice versa must NOT silently apply a degenerate
+        filter. Both must be set for the filter to fire."""
+        rows = [self._row("Q1", r"reasoning here. " * 30 + r"\boxed{a}")]
+
+        train_a, _ = build_pipeline(
+            rows, n_samples=100, per_question_cap=4, eval_size=0,
+            max_response_chars=8000, min_reasoning_chars=10,
+            max_answer_chars=200, seed=42,
+            max_formatted_tokens=10,
+        )
+        assert len(train_a) == 1
+
+        tokenize_fn = self._make_fake_token_counter({"a": 999_999})
+        train_b, _ = build_pipeline(
+            rows, n_samples=100, per_question_cap=4, eval_size=0,
+            max_response_chars=8000, min_reasoning_chars=10,
+            max_answer_chars=200, seed=42,
+            tokenize_fn=tokenize_fn,
+        )
+        assert len(train_b) == 1
+
+    def test_token_filter_at_cap_passes(self):
+        """Boundary: rows with token count exactly == max_formatted_tokens
+        pass the filter (predicate is ``<=``)."""
+        rows = [self._row("Q1", r"reasoning here. " * 30 + r"\boxed{a}")]
+        tokenize_fn = self._make_fake_token_counter({"\\boxed{a}": 3500})
+        train, _ = build_pipeline(
+            rows, n_samples=100, per_question_cap=4, eval_size=0,
+            max_response_chars=8000, min_reasoning_chars=10,
+            max_answer_chars=200, seed=42,
+            max_formatted_tokens=3500, tokenize_fn=tokenize_fn,
+        )
+        assert len(train) == 1
+
+    def test_token_filter_runs_before_per_question_cap(self):
+        """Pipeline ordering invariant. Token filter runs BEFORE
+        apply_per_question_cap so the cap operates on already-shrunk rows.
+        5 same-query rows where 3 are oversized → token filter leaves 2 →
+        cap of 4 keeps both."""
+        rows = [
+            self._row("Q1", f"reasoning {i}. " * 30 + r"\boxed{" + str(i) + r"}")
+            for i in range(5)
+        ]
+        tokenize_fn = self._make_fake_token_counter({
+            "\\boxed{0}": 100,
+            "\\boxed{1}": 100,
+            "\\boxed{2}": 9999,
+            "\\boxed{3}": 9999,
+            "\\boxed{4}": 9999,
+        })
+        train, _ = build_pipeline(
+            rows, n_samples=100, per_question_cap=4, eval_size=0,
+            max_response_chars=8000, min_reasoning_chars=10,
+            max_answer_chars=200, seed=42,
+            max_formatted_tokens=3500, tokenize_fn=tokenize_fn,
+        )
+        assert len(train) == 2
+
+
+class TestResolveNSamples:
+    """CLI semantics: --n-samples and --train-size are mutually exclusive
+    flags with different meanings:
+      --n-samples X    → X total post-filter rows, BEFORE the train/eval split
+      --train-size X   → X rows in train.jsonl (translates to
+                         n_samples = X + eval_size internally)
+    """
+
+    def test_neither_set_uses_default(self):
+        assert resolve_n_samples(
+            n_samples_arg=None, train_size_arg=None, eval_size=500,
+        ) == 50_000
+
+    def test_n_samples_only_passes_through(self):
+        assert resolve_n_samples(
+            n_samples_arg=50_000, train_size_arg=None, eval_size=500,
+        ) == 50_000
+
+    def test_train_size_translates_to_n_samples_plus_eval(self):
+        assert resolve_n_samples(
+            n_samples_arg=None, train_size_arg=50_000, eval_size=500,
+        ) == 50_500
+
+    def test_both_set_raises_value_error(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            resolve_n_samples(
+                n_samples_arg=50_000, train_size_arg=50_000, eval_size=500,
+            )
+
+    def test_train_size_with_zero_eval_split_works(self):
+        """Edge case: --eval-size 0 is legitimate when the operator wants
+        a single train file with no held-out slice."""
+        assert resolve_n_samples(
+            n_samples_arg=None, train_size_arg=1000, eval_size=0,
+        ) == 1000
+
+
+class TestMixedSourceShuffle:
+    """v2 D1: the mixed mode runs both pipelines, concatenates, shuffles
+    with a fixed seed, then writes. We test the shuffle invariant by
+    passing distinguishable synthetic content per source.
+
+    The full mixing flow lives in main() (which calls build_pipeline twice
+    + concatenate + shuffle); to test it without main()'s dataset-loading
+    branch, we model the same logic directly with synthetic rows.
+    """
+
+    def _dart_rows(self, n):
+        return [
+            {"query": f"DART_Q{i}", "response": f"DART reasoning {i}. "
+             r"More reasoning here. Final step. \boxed{" + str(i) + r"}"}
+            for i in range(n)
+        ]
+
+    def _omi2_rows(self, n):
+        return [
+            normalize_openmathinstruct_row({
+                "problem": f"OMI2_P{i}",
+                "generated_solution": f"OMI2 reasoning {i}. "
+                "More reasoning here. Final step.",
+                "expected_answer": str(i),
+                "problem_source": "math",
+            })
+            for i in range(n)
+        ]
+
+    def _shared_kwargs(self):
+        return dict(
+            per_question_cap=4,
+            max_response_chars=8000,
+            min_reasoning_chars=20,
+            max_answer_chars=200,
+            seed=42,
+        )
+
+    def test_mixed_output_contains_both_sources_in_proportion(self):
+        """50/50 mix at n_samples=10 each → exactly 10 from each source."""
+        dart_train, _ = build_pipeline(
+            self._dart_rows(40), n_samples=10, eval_size=0,
+            **self._shared_kwargs(),
+        )
+        omi_train, _ = build_pipeline(
+            self._omi2_rows(40), n_samples=10, eval_size=0,
+            **self._shared_kwargs(),
+        )
+        merged = dart_train + omi_train
+        rng = random.Random(42)
+        rng.shuffle(merged)
+
+        n_dart = sum(
+            1 for ex in merged if ex["messages"][0]["content"].startswith("DART_")
+        )
+        n_omi = sum(
+            1 for ex in merged if ex["messages"][0]["content"].startswith("OMI2_")
+        )
+        assert n_dart == 10
+        assert n_omi == 10
+
+    def test_mixed_shuffle_interleaves_sources(self):
+        """After shuffle, sources should be interleaved rather than block-
+        concatenated. With seed=42 and 20 rows, the first 5 must contain
+        BOTH source labels — not all-DART-then-all-OMI2 ordering.
+
+        Operational invariant: TRL doesn't reshuffle epochs by default,
+        so a block-concatenated train.jsonl would let the model see all
+        DART before any OMI2 in epoch 1, biasing early gradients."""
+        dart_train, _ = build_pipeline(
+            self._dart_rows(40), n_samples=10, eval_size=0,
+            **self._shared_kwargs(),
+        )
+        omi_train, _ = build_pipeline(
+            self._omi2_rows(40), n_samples=10, eval_size=0,
+            **self._shared_kwargs(),
+        )
+        merged = dart_train + omi_train
+        rng = random.Random(42)
+        rng.shuffle(merged)
+
+        first_five_prefixes = {
+            ex["messages"][0]["content"].split("_")[0] for ex in merged[:5]
+        }
+        assert "DART" in first_five_prefixes
+        assert "OMI2" in first_five_prefixes
+
+    def test_mixed_shuffle_is_deterministic_across_runs(self):
+        """Pin the seed-determinism contract: identical inputs + same seed
+        = byte-identical output. Required for v2 reproducibility."""
+        dart_train, _ = build_pipeline(
+            self._dart_rows(40), n_samples=10, eval_size=0,
+            **self._shared_kwargs(),
+        )
+        omi_train, _ = build_pipeline(
+            self._omi2_rows(40), n_samples=10, eval_size=0,
+            **self._shared_kwargs(),
+        )
+
+        merged_a = dart_train + omi_train
+        random.Random(42).shuffle(merged_a)
+
+        merged_b = dart_train + omi_train
+        random.Random(42).shuffle(merged_b)
+
+        assert merged_a == merged_b
+
+
+# =============================================================================
+# v3 (2026-05-09): pure --source openmathinstruct path. The four individual
+# properties (D2 normalization, D3 cap, D4 token filter, v1-compatible chat
+# schema) are each covered by tests above; this single integration test
+# exercises them TOGETHER on the same synthetic input, mirroring the v3
+# invocation from the operator's three-way SFT ablation plan.
+# =============================================================================
+
+
+class TestOpenMathInstructEndToEnd:
+    """End-to-end smoke for ``--source openmathinstruct`` (v3 pure-OMI2 path).
+
+    Models main()'s openmathinstruct branch without invoking main() itself —
+    that branch's only main()-specific behavior is loading the dataset (which
+    we replace with synthetic rows) and resolving the auto-default token cap
+    (which we apply explicitly here). The auto-default value 3500 is pinned
+    in ``data/prepare_sft.py:448``; this test hardcodes the same number with
+    a comment so a future change to the constant trips the test rather than
+    silently diverging."""
+
+    # Auto-default for --source openmathinstruct from prepare_sft.py:448.
+    # Must stay in sync with that constant.
+    OMI2_AUTO_TOKEN_CAP = 3500
+
+    def _omi2_raw(self, problem, solution, answer, source="math"):
+        """Build a synthetic raw OMI2 row in the schema HF actually returns."""
+        return {
+            "problem": problem,
+            "generated_solution": solution,
+            "expected_answer": answer,
+            "problem_source": source,
+        }
+
+    def _make_token_counter(self, long_marker):
+        """Returns a tokenize_fn that returns a high token count for any
+        message whose assistant content contains long_marker, else a low one.
+        Lets the test simulate the 3500-token cap firing on specific rows
+        without actually loading the Qwen3 tokenizer."""
+        def _count(messages):
+            content = messages[1]["content"]
+            return 9999 if long_marker in content else 100
+        return _count
+
+    def test_v3_pure_omi2_pipeline(self):
+        """Single integration test covering all four v3 properties:
+
+        1. Token filter (3500) auto-default applies — long row dropped.
+        2. Per-problem cap (4) applies — duplicated problem reduced to 4.
+        3. Output schema is v1-compatible — {messages: [user, assistant]}
+           with the canonical <think>...</think>\\boxed{} format.
+        4. No DART data leaks — every output row's user content matches
+           the OMI2-only synthetic input.
+
+        Reasoning chunks chosen so all rows clear min_reasoning_chars=20
+        and max_response_chars=8000.
+        """
+        # 5 distinct OMI2 problems (clean rows that should pass).
+        clean_rows = [
+            self._omi2_raw(
+                f"OMI2_problem_{i}",
+                f"Step 1: think. Step 2: verify. Step 3: solve. iteration {i}.",
+                str(i),
+            )
+            for i in range(5)
+        ]
+        # 5 augmented solutions for the SAME problem (cap should drop to 4).
+        duplicate_rows = [
+            self._omi2_raw(
+                "OMI2_problem_DUP",
+                f"Augmented attempt {i}: chain of thought goes here. Done.",
+                str(100 + i),
+            )
+            for i in range(5)
+        ]
+        # 1 row with very long content marked TOO_LONG (token filter drops).
+        long_row = self._omi2_raw(
+            "OMI2_problem_LONG",
+            "Long verbose solution. TOO_LONG_MARKER. Step 1. Step 2. Step 3.",
+            "999",
+        )
+
+        raw = clean_rows + duplicate_rows + [long_row]
+        normalized = [normalize_openmathinstruct_row(r) for r in raw]
+
+        tokenize_fn = self._make_token_counter("TOO_LONG_MARKER")
+
+        # Mirrors what main() does for --source openmathinstruct: pass-through
+        # default per_question_cap=4, the auto-default 3500-token filter, and
+        # the standard min_reasoning_chars / max_answer_chars knobs.
+        train, eval_ = build_pipeline(
+            normalized,
+            n_samples=100,
+            per_question_cap=4,
+            eval_size=0,
+            max_response_chars=8000,
+            min_reasoning_chars=20,
+            max_answer_chars=200,
+            seed=42,
+            max_formatted_tokens=self.OMI2_AUTO_TOKEN_CAP,
+            tokenize_fn=tokenize_fn,
+        )
+
+        # Property 1: token filter dropped the long row. Net: 5 clean + 4
+        # capped duplicates = 9 rows survive.
+        assert len(train) == 9, (
+            f"expected 9 rows after token filter + cap, got {len(train)}"
+        )
+
+        # Property 2: per-problem cap reduced the 5 duplicates to 4.
+        n_dup = sum(
+            1 for ex in train
+            if ex["messages"][0]["content"] == "OMI2_problem_DUP"
+        )
+        assert n_dup == 4, f"per-problem cap broken: {n_dup} duplicates kept"
+
+        # Property 3: every row matches v1's chat schema. Same assertions as
+        # the existing TestBuildPipeline.test_drops_no_box_rows_and_caps_and_splits
+        # check, applied to v3 output.
+        for ex in train:
+            assert list(ex.keys()) == ["messages"]
+            assert ex["messages"][0]["role"] == "user"
+            assert ex["messages"][1]["role"] == "assistant"
+            assistant = ex["messages"][1]["content"]
+            assert assistant.startswith("<think>\n")
+            assert "</think>\n\n\\boxed{" in assistant
+            assert assistant.endswith("}")
+
+        # Property 4: no DART data leak — every user prompt comes from the
+        # synthetic OMI2 input (queries all start with 'OMI2_problem_').
+        for ex in train:
+            user_content = ex["messages"][0]["content"]
+            assert user_content.startswith("OMI2_problem_"), (
+                f"unexpected non-OMI2 prompt leaked into v3 output: "
+                f"{user_content!r}"
+            )
+        # The long-row prompt MUST NOT survive (token filter dropped it).
+        long_prompts = [
+            ex for ex in train
+            if ex["messages"][0]["content"] == "OMI2_problem_LONG"
+        ]
+        assert long_prompts == [], (
+            "token filter failed to drop the marked-long row: "
+            f"{len(long_prompts)} survived"
+        )

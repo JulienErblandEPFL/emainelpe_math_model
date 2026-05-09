@@ -58,3 +58,29 @@ variance) and look for movement on both targets together.
 **What this number means.** It's the floor that any post-SFT checkpoint
 must beat to claim the SFT phase added value. Pass@1 = 0.300 on N=10
 OOD competition problems is the bar.
+
+---
+
+## Update 2026-05-09 — methodology gap, CI-mode re-baseline pending
+
+The numbers above were taken under the legacy `scripts/eval_local.py`
+defaults: `max_model_len=20480`, `max_tokens=16384`. Per the team
+project README, the actual CI ceiling is `max_model_len=4096`
+(combined prompt + generation). On 2026-05-09 the script's default
+flipped to CI-faithful 4096/4096, with `--no-ci-mode` reinstating the
+legacy permissive caps for ablations.
+
+**What this means for the recorded numbers.** pass@1 = 0.300 and
+pass@8 = 0.400 are a *soft upper estimate* of the bare-model
+performance under the CI's actual budget. The true CI-mode baseline
+may be lower because long `<think>` chains can be clipped at 4096
+combined tokens. They remain the best estimate available until a
+CI-mode re-baseline lands on RCP; treat the 0.400 pass@8 as a
+pending-confirmation soft floor for the SFT-vs-baseline delta. The
+methodology gap is also flagged in CLAUDE.md → "Bar to claim SFT
+added value" so the policy stays in sync with the data here.
+
+**Don't edit the original numbers above** — they record what was
+actually measured on 2026-05-07 with the then-current settings. When
+the CI-mode re-baseline runs, append a new section below this one
+rather than overwriting history.
