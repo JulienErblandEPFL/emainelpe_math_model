@@ -29,6 +29,14 @@ source. CLAUDE.md flags the conflict in the "Eval contract" section.
   longer generation budget matters (e.g., probing whether a longer
   `<think>` chain would have produced a `\boxed{...}`).
 
+**Measured (2026-05-09).** Under ci-faithful caps on
+`validation_samples/math.jsonl` (N=10), the pushed v1 SFT checkpoint
+reports **pass@8 = 0.40** vs **0.20 for bare `Qwen/Qwen3-1.7B`** —
+a +20 pp improvement, well outside the ±5 pp noise band. This is the
+current best estimate of what the nightly CI will see; the secret CI
+eval set may differ in difficulty mix. Full breakdown in
+`docs/BASELINE.md`.
+
 ## Data prep
 
 `data/prepare_sft.py` produces the JSONL files `scripts/train_sft.py` consumes. Two dataset variants are supported:

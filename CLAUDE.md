@@ -101,7 +101,7 @@ them to be predictive of CI scores.
 | `max_model_len` | **4096** (combined prompt + generated tokens) | Per the team README: "Max model length 4096. The generation stops once the `\boxed{...}` answer is generated, or the model reaches an EoS token, or the maximum length is reached." This is vLLM's combined-context cap; an effective per-completion ceiling once you subtract the prompt. |
 | `max_new_tokens` | **Effectively ≤ 4096 − \|prompt\|** under the README's cap | **Conflict surfaced.** `docs/project_description.pdf` (older, page 3) explicitly says `Max new tokens: 16384`. The README is more recent and binding for CI behavior; under `max_model_len=4096`, a 16384 generation cap is unreachable. We treat 4096 as the conservative working ceiling. `scripts/eval_local.py` defaults to CI-faithful 4096/4096 and exposes `--no-ci-mode` as the legacy 20480/16384 escape hatch. NOT a training choice — `lora.yaml:max_seq_length=4096` is the training cap, and it happens to coincide with the README's eval cap, but the two are independent settings. |
 | Wall-clock cap | 1800 s per model | Per the README. n=8 generations × ~10 problems must fit. Slow checkpoints (e.g., chronic OOM-thrash, mis-tuned `gpu_memory_utilization`) can hit this cap and get partial credit only. |
-| Metrics | pass@1 and pass@8 (math headline = **pass@8**) | Unbiased Chen-et-al-2021 estimator (`evaluate.pass_at_k.pass_at_k`): `pass@k = 1 - C(n-c, k) / C(n, k)`. With n=8: pass@1 = mean(c/8) across problems; pass@8 = mean(any-of-8). **Per the README, math is graded on pass@8 (free-form).** Knowledge / Safety / Multilinguality are pass@1 MC — context only; not this repo's concern. |
+| Metrics | pass@1 and pass@8 (math headline = **pass@8**) | Unbiased Chen-et-al-2021 estimator (`evaluate.pass_at_k.pass_at_k`): `pass@k = 1 - C(n-c, k) / C(n, k)`. With n=8: pass@1 = mean(c/8) across problems; pass@8 = mean(any-of-8). **Per the README, math is graded on pass@8 (free-form).** Knowledge / Safety / Multilinguality are pass@1 MC — context only; not this repo's concern. **Measured ci-faithful baseline (2026-05-09):** bare `Qwen/Qwen3-1.7B` reports pass@1 = 0.1625, pass@8 = 0.2000 on `validation_samples/math.jsonl`. The 0.400 figure that appeared earlier was a *legacy-cap* number and is no longer the headline baseline (see `docs/BASELINE.md` → "2026-05-09 CI-mode re-baseline"). |
 
 **Use the vendored `evaluate/` directly.** Do not re-implement extraction,
 `is_equiv`, or pass@k. The CI runs byte-identical code, and any
@@ -147,16 +147,32 @@ README. SFT adds value when the post-Stage-3 checkpoint's pass@8 on
 `validation_samples/math.jsonl` exceeds the bare-model baseline run
 under the same context caps (`max_model_len=4096`, `max_tokens=4096`).
 
-**Baseline status (2026-05-09).** `docs/BASELINE.md` records pass@1
-= 0.300, pass@8 = 0.400. Those numbers were measured under the legacy
-20480/16384 caps — *more permissive than CI*. They are the best
-estimate available today but are not authoritative for the CI bar:
-a CI-mode re-baseline (`scripts/eval_local.py` default after the
-2026-05-09 default-flip) is pending on RCP. Treat 0.400 as a soft
-upper estimate of the bare-model pass@8; the true CI-faithful baseline
-may be lower (4096-token cap can clip long `<think>` chains that
-otherwise produce a boxed answer). Once the re-baseline lands, update
-`BASELINE.md` and replace the soft estimate here with the measured value.
+**Measured (2026-05-09 CI-mode re-baseline, on RCP).** Under
+ci-faithful caps:
+
+| Model                              | pass@1   | pass@8   |
+|------------------------------------|----------|----------|
+| `Qwen/Qwen3-1.7B` (bare baseline)  | 0.1625   | 0.2000   |
+| `cs-552-2026-emainelpe/math_model` (v1 SFT, pushed) | 0.2125 | 0.4000 |
+
+**v1 SFT cleared the bar.** Pass@8 jumped from **0.2000 to 0.4000
+(+20 pp)** — comfortably outside the ±5 pp noise band on N=10. Pass@1
+also moved in the right direction (+5 pp), at the noise threshold.
+
+**The bar for future SFT variants.** Any new SFT recipe (v2 mixed
+DART+OMI2, v3 OMI2-only, future tweaks) must beat **pass@8 = 0.4000
+under ci-faithful caps** on the same eval set to be considered an
+improvement over v1. Anything within ±5 pp of 0.4000 is within noise
+on N=10 and not a real signal — re-run on `data_out/eval.jsonl` (the
+500-row DART held-out slice) for a tighter read.
+
+**Legacy-cap reading is now an ablation knob, not the headline.**
+Under `--no-ci-mode` the pass@8 is flat at 0.30 across baseline and
+v1 SFT, and pass@1 actually *drops* on the SFT model (0.29 → 0.20).
+The likely reading: under the loose 16384 cap, the SFT model spirals
+(loop behavior) while the bare model gets enough room to recover.
+The CI grades under tight caps, so legacy numbers are not predictive.
+Full write-up in `docs/BASELINE.md` → "2026-05-09 CI-mode re-baseline".
 
 Pass@1 is reported alongside as a secondary diagnostic — a pass@1 jump
 with flat pass@8 means the model became more consistent but isn't

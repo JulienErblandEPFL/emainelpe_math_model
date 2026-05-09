@@ -355,18 +355,29 @@ parameters below are pinned to match the "Eval contract" section in
 
 **Bar to claim "SFT added value" (post-Stage-3 checkpoint vs baseline).**
 The team README makes **pass@8 the headline metric for math** (free-form,
-graded on pass@8). The recorded bare-model numbers in `BASELINE.md`
-(pass@1 = 0.300, pass@8 = 0.400, 2026-05-07) were measured under the
-*legacy* 20480/16384 caps — more permissive than CI. They are a soft
-upper estimate of the true CI-faithful baseline; a re-baseline under
-the new default (`max_model_len=4096`, `max_tokens=4096`) is pending
-on RCP. Once it lands, the primary criterion to beat is **CI-mode
-pass@8 above the CI-mode bare baseline**. Until then, treat
-pass@8 = 0.400 as the soft floor with the caveat that it may drop
-under the 4096 cap (long `<think>` chains can clip). Report pass@1
-alongside as secondary signal — a pass@1 jump with flat pass@8 means
-the model became more consistent but isn't unlocking new problems;
-that's a useful diagnostic but isn't what the CI grades.
+graded on pass@8). The 2026-05-09 CI-mode re-baseline on RCP measured
+the bare model and the v1 SFT checkpoint under ci-faithful caps
+(`max_model_len=4096`, `max_tokens=4096`):
+
+| Model                              | pass@1   | pass@8   |
+|------------------------------------|----------|----------|
+| `Qwen/Qwen3-1.7B` (bare baseline)  | 0.1625   | 0.2000   |
+| `cs-552-2026-emainelpe/math_model` (v1 SFT) | 0.2125 | 0.4000 |
+
+**v1 SFT cleared the bar:** pass@8 = 0.2000 → 0.4000 (+20 pp,
+comfortably outside the ±5 pp noise band on N=10). Pass@1 = 0.1625 →
+0.2125 (+5 pp, at the noise threshold). The improvement disappears
+under legacy caps (`--no-ci-mode`) because the SFT model spirals when
+given the longer 16384 budget — see `docs/BASELINE.md` →
+"2026-05-09 CI-mode re-baseline" for the full table and interpretation.
+
+**Bar for future SFT variants.** Any new SFT recipe (v2 mixed, v3
+OMI2-only) must beat **pass@8 = 0.4000 under ci-faithful caps** on
+the same eval set to be considered an improvement over v1. Within
+±5 pp of 0.4000 is within noise on N=10. Pass@1 stays a secondary
+diagnostic: a pass@1 jump with flat pass@8 means the model became
+more consistent but isn't unlocking new problems — useful for
+ablation reads, not for grading.
 
 **Noise budget on the default snapshot.** N=10 means the standard error
 on pass@1 is roughly ±5 percentage points; pass@8 is binary per problem

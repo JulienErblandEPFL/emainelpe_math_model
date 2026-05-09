@@ -84,3 +84,79 @@ added value" so the policy stays in sync with the data here.
 actually measured on 2026-05-07 with the then-current settings. When
 the CI-mode re-baseline runs, append a new section below this one
 rather than overwriting history.
+
+---
+
+## 2026-05-09 CI-mode re-baseline
+
+**Date.** 2026-05-09
+**Hardware.** 1× A100 40GB on RCP cluster
+**Eval file.** `validation_samples/math.jsonl` (course-vendored OOD
+competition snapshot, N=10)
+**Sampling.** n=8, seed=42. Bare model used `temperature=0.3` (the
+script's pre-Stage-5 fallback because the bare HF id ships no
+`generation_config.json`); the merged checkpoint used the
+`generation_config.json` written by Stage 5 — `temperature=0.6`.
+
+### Results
+
+| Mode         | Model                              | pass@1   | pass@8   |
+|--------------|------------------------------------|----------|----------|
+| ci-faithful  | `Qwen/Qwen3-1.7B`                  | 0.1625   | 0.2000   |
+| ci-faithful  | `cs-552-2026-emainelpe/math_model` | 0.2125   | 0.4000   |
+| legacy       | `Qwen/Qwen3-1.7B`                  | 0.2875   | 0.3000   |
+| legacy       | `cs-552-2026-emainelpe/math_model` | 0.2000   | 0.3000   |
+
+ci-faithful: `max_model_len=4096`, `max_tokens=4096` (default after
+the 2026-05-09 default-flip). legacy: `max_model_len=20480`,
+`max_tokens=16384` (`--no-ci-mode`).
+
+### Headline finding
+
+Under ci-faithful caps — what the nightly CI actually exercises —
+v1 SFT lifts pass@8 from **0.2000 to 0.4000 (+20 pp)**, well outside
+the ±5 pp noise band noted earlier in this file. Pass@1 also moves
+in the right direction (+5 pp).
+
+Under legacy caps the improvement disappears: pass@8 is flat at
+0.30 across baseline and v1 SFT, and pass@1 actually drops on the
+SFT model (0.29 → 0.20).
+
+### Most plausible interpretation
+
+The SFT model produces longer reasoning chains than baseline. Under
+the tight 4096-combined cap it commits to a `\boxed{...}` answer
+within budget; under the loose 16384 cap it spirals (the loop
+behavior diagnosed in earlier eval analysis), and the extra tokens
+buy the bare model more recovery room while costing the SFT model
+its commit-discipline. **Operational consequence:** ci-faithful is
+the predictive number for what CI will report. legacy is now an
+ablation knob, not the headline reading.
+
+### What this replaces
+
+- The 2026-05-07 numbers above (pass@1=0.300, pass@8=0.400) were
+  measured under legacy caps and are no longer the headline
+  baseline. They stay in this file as historical record.
+- The "soft upper estimate" language in CLAUDE.md → "Bar to claim
+  SFT added value" is replaced (in the same commit) with the
+  measured ci-faithful values. v1 SFT (pushed to HF) cleared the
+  bar. Future SFT variants (v2 mixed, v3 OMI2-only) must beat
+  pass@8 = 0.4000 under ci-faithful caps to be considered an
+  improvement over v1.
+
+### Caveats still standing
+
+- **N=10 noise budget unchanged.** ±5 pp standard error on pass@1
+  applies to the new numbers too. The +20 pp pass@8 jump is
+  comfortably outside noise; the +5 pp pass@1 jump is at the noise
+  threshold and should not be over-interpreted on this snapshot.
+  For tighter signals re-run on `data_out/eval.jsonl` (500-row DART
+  held-out slice).
+- **OOD competition problems only.** This snapshot is what CI uses,
+  but it doesn't track in-distribution generalization. Pair with
+  the DART eval slice for a fuller picture.
+- **The secret CI eval set is not this snapshot.** The team README
+  describes the public snapshot as a calibration tool; the CI's
+  private set may differ in difficulty mix. Treat 0.4000 as the
+  best available estimate, not a CI-grade promise.
