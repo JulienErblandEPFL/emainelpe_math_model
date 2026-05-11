@@ -176,6 +176,10 @@ def sft_config_kwargs(
         "logging_steps": 10,
         "eval_strategy": "steps",
         "eval_steps": 500,
+        # Chunked eval-logits gather: pure-OMI2 (v3) eval rows are long enough
+        # that a single-allocation (B × T × V × 2B) logits tensor OOMs on
+        # A100 40GB (saw 13.77 GiB allocation fail in compute_loss).
+        "eval_accumulation_steps": 4,
         "save_strategy": "steps",
         "save_steps": 500,
         "save_total_limit": 2,

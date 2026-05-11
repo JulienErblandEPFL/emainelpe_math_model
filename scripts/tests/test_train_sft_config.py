@@ -177,6 +177,31 @@ def test_sft_config_kwargs_save_and_eval_cadence():
     assert kw["save_total_limit"] == 2
 
 
+def test_sft_config_kwargs_eval_accumulation_steps_avoids_oom():
+    """eval_accumulation_steps must be >=4 to chunk the logits-gather step.
+
+    Rationale: with Qwen3-1.7B vocab=151,936 and max_seq=4096, a single
+    (B × T × V × 2B) eval-logits tensor exceeds A100-40GB headroom on
+    pure-OMI2 (v3) data, where every eval row is token-dense (Llama3.1-405B
+    solutions are long). The TRL stack traced to:
+        trl/trainer/sft_trainer.py:1349  compute_loss
+        torch.OutOfMemoryError: Tried to allocate 13.77 GiB.
+    Setting eval_accumulation_steps>=4 makes Trainer move predictions to
+    CPU in chunks instead of accumulating one mega-tensor on GPU."""
+    kw = _call_sft()
+    assert "eval_accumulation_steps" in kw, (
+        "eval_accumulation_steps must be set explicitly; the Trainer "
+        "default (None) gathers eval logits in a single allocation and "
+        "OOMs on long-sequence eval sets (v3 pure-OMI2)."
+    )
+    assert kw["eval_accumulation_steps"] >= 4, (
+        f"eval_accumulation_steps={kw['eval_accumulation_steps']} is "
+        "below the 4-chunk minimum required to fit v3 eval logits on "
+        "A100 40GB. If raising this still OOMs, also drop "
+        "per_device_eval_batch_size — see the OOM-fix notes in train_sft.py."
+    )
+
+
 def test_sft_config_kwargs_report_to_follows_use_wandb():
     assert _call_sft(use_wandb=True)["report_to"] == "wandb"
     assert _call_sft(use_wandb=False)["report_to"] == "none"
