@@ -23,6 +23,7 @@ SCRIPT = REPO_ROOT / "rcp" / "submit_train.sh"
 SCRIPT_ENV_VARS = (
     "GASPAR", "GROUP", "HF_TOKEN", "WANDB_API_KEY",
     "RESUME", "IMAGE", "SCRATCH_USER", "N_SAMPLES", "EPOCHS", "REPO_DIR",
+    "DATA_OUT_DIR", "SKIP_PREP",
 )
 
 
@@ -123,3 +124,56 @@ def test_default_repo_dir_uses_scratch_user_not_gaspar():
     )
     assert "/scratch/Julien/emainelpe_math_model" in result.stdout
     assert "/scratch/erbland/" not in result.stdout
+
+
+def test_data_out_dir_override_redirects_both_prep_and_train():
+    """When DATA_OUT_DIR is set, BOTH the prepare_sft --output-dir AND the
+    train_sft --train-file/--eval-file must point at the override path —
+    not the default /scratch/${SCRATCH_USER}/data_out. Catches a
+    regression where only one of the two reads picked up the env var."""
+    result = _run(
+        {
+            "GASPAR": "erbland",
+            "GROUP": "g65",
+            "DATA_OUT_DIR": "/scratch/Julien/data_out_v2",
+        },
+        ["--dry-run"],
+    )
+    assert "--output-dir /scratch/Julien/data_out_v2" in result.stdout
+    assert "--train-file /scratch/Julien/data_out_v2/train.jsonl" in result.stdout
+    assert "--eval-file /scratch/Julien/data_out_v2/eval.jsonl" in result.stdout
+    # The default v1 path must not leak in alongside the override.
+    assert "/scratch/Julien/data_out/train.jsonl" not in result.stdout
+
+
+def test_skip_prep_omits_prepare_sft_call():
+    """SKIP_PREP=1 must drop the in-pod `python data/prepare_sft.py` call
+    entirely while leaving train_sft.py untouched. Operators rely on this
+    when DATA_OUT_DIR points at v2/v3 data prepared offline — running v1
+    prep would clobber the carefully-prepped JSONL."""
+    result = _run(
+        {
+            "GASPAR": "erbland",
+            "GROUP": "g65",
+            "DATA_OUT_DIR": "/scratch/Julien/data_out_v3",
+            "SKIP_PREP": "1",
+        },
+        ["--dry-run"],
+    )
+    assert "python data/prepare_sft.py" not in result.stdout
+    assert "python scripts/train_sft.py" in result.stdout
+    # Train flags still point at the override path.
+    assert "--train-file /scratch/Julien/data_out_v3/train.jsonl" in result.stdout
+
+
+def test_skip_prep_unset_keeps_prepare_sft_call():
+    """The default (SKIP_PREP unset) must keep emitting prepare_sft.py —
+    sister-test to test_skip_prep_omits_prepare_sft_call. Without this
+    explicit positive assertion, a regression that always-skips would
+    only fail when someone happens to set SKIP_PREP, slipping past CI."""
+    result = _run(
+        {"GASPAR": "erbland", "GROUP": "g65"},
+        ["--dry-run"],
+    )
+    assert "python data/prepare_sft.py" in result.stdout
+    assert "python scripts/train_sft.py" in result.stdout

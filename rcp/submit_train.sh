@@ -24,7 +24,17 @@
 #                 "root", which would also be wrong as a path component.
 #   REPO_DIR      Repo path inside the pod.
 #                 Default: /scratch/${SCRATCH_USER}/emainelpe_math_model
-#   N_SAMPLES     prepare_sft.py --n-samples. Default: 50000
+#   DATA_OUT_DIR  Where train.jsonl / eval.jsonl live (and where prepare_sft.py
+#                 writes, unless SKIP_PREP is set). Default:
+#                 /scratch/${SCRATCH_USER}/data_out. Override to point at v2
+#                 (mixed) or v3 (pure OMI2) data, e.g.
+#                 DATA_OUT_DIR=/scratch/Julien/data_out_v2.
+#   SKIP_PREP     If non-empty, skip the in-pod prepare_sft.py call entirely
+#                 and go straight to train_sft.py. Required when DATA_OUT_DIR
+#                 points at v2/v3 data prepared offline — otherwise the
+#                 default v1 DART prep would overwrite it.
+#   N_SAMPLES     prepare_sft.py --n-samples. Default: 50000. Ignored when
+#                 SKIP_PREP is set.
 #   EPOCHS        train_sft.py --epochs.    Default: 2
 #   RESUME        Forwarded to train_sft.py --resume when non-empty.
 #                 Use "latest" to resume from the newest checkpoint under
@@ -51,7 +61,7 @@ while (( $# )); do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     -h|--help)
-      sed -n '2,31p' "$0"
+      sed -n '2,40p' "$0"
       exit 0
       ;;
     -*)
@@ -99,7 +109,13 @@ REPO_DIR="${REPO_DIR:-/scratch/${SCRATCH_USER}/emainelpe_math_model}"
 # REPO_DIR stay clean; `data_out/` and `runs/` are just sibling dirs
 # under /scratch/${SCRATCH_USER}/. The .gitignore safety net is no longer
 # the only line of defense.
-DATA_OUT_DIR="/scratch/${SCRATCH_USER}/data_out"
+#
+# DATA_OUT_DIR override semantics: set the env var to point at v2/v3 data
+# (e.g. DATA_OUT_DIR=/scratch/Julien/data_out_v2). Set SKIP_PREP=1 to skip
+# the in-pod prepare_sft.py step (assumes data already exists at
+# DATA_OUT_DIR). Without SKIP_PREP, prepare_sft.py runs with v1 defaults
+# and would clobber any v2/v3 data already at that path.
+DATA_OUT_DIR="${DATA_OUT_DIR:-/scratch/${SCRATCH_USER}/data_out}"
 RUN_OUT_DIR="/scratch/${SCRATCH_USER}/runs/${RUN_NAME}"
 
 # `${RESUME:+ --resume ${RESUME}}` expands to "" when RESUME is unset/empty
@@ -119,7 +135,12 @@ TRAIN_FLAGS+="${RESUME:+ --resume ${RESUME}}"
 POD_CMD="ln -sf \"\$(command -v python3)\" /usr/local/bin/python"
 POD_CMD+=" && cd ${REPO_DIR}"
 POD_CMD+=" && pip install -r requirements.txt"
-POD_CMD+=" && python data/prepare_sft.py --output-dir ${DATA_OUT_DIR} --n-samples ${N_SAMPLES}"
+# Skip prepare_sft.py when SKIP_PREP is set — used when DATA_OUT_DIR
+# already contains v2/v3 data prepared offline; running the default v1
+# prep would clobber it.
+if [[ -z "${SKIP_PREP:-}" ]]; then
+  POD_CMD+=" && python data/prepare_sft.py --output-dir ${DATA_OUT_DIR} --n-samples ${N_SAMPLES}"
+fi
 POD_CMD+=" && python scripts/train_sft.py ${TRAIN_FLAGS}"
 
 # ----- Compose the runai args -------------------------------------------
@@ -164,12 +185,14 @@ print_args_masked() {
 
 if (( DRY_RUN )); then
   echo "=== submit_train.sh --dry-run ==="
-  echo "RUN_NAME : ${RUN_NAME}"
-  echo "REPO_DIR : ${REPO_DIR}"
-  echo "IMAGE    : ${IMAGE}"
-  echo "N_SAMPLES: ${N_SAMPLES}"
-  echo "EPOCHS   : ${EPOCHS}"
-  echo "RESUME   : ${RESUME:-<unset>}"
+  echo "RUN_NAME    : ${RUN_NAME}"
+  echo "REPO_DIR    : ${REPO_DIR}"
+  echo "IMAGE       : ${IMAGE}"
+  echo "DATA_OUT_DIR: ${DATA_OUT_DIR}"
+  echo "SKIP_PREP   : ${SKIP_PREP:-<unset>}"
+  echo "N_SAMPLES   : ${N_SAMPLES}"
+  echo "EPOCHS      : ${EPOCHS}"
+  echo "RESUME      : ${RESUME:-<unset>}"
   echo
   echo "Assembled command (one arg per line, secrets masked):"
   print_args_masked
