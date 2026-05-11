@@ -177,28 +177,40 @@ def test_sft_config_kwargs_save_and_eval_cadence():
     assert kw["save_total_limit"] == 2
 
 
-def test_sft_config_kwargs_eval_accumulation_steps_avoids_oom():
-    """eval_accumulation_steps must be >=4 to chunk the logits-gather step.
+def test_sft_config_kwargs_eval_memory_caps_avoid_oom():
+    """Both per_device_eval_batch_size=1 AND eval_accumulation_steps>=4
+    must be set to fit eval-time logits on A100 40GB.
 
-    Rationale: with Qwen3-1.7B vocab=151,936 and max_seq=4096, a single
-    (B × T × V × 2B) eval-logits tensor exceeds A100-40GB headroom on
-    pure-OMI2 (v3) data, where every eval row is token-dense (Llama3.1-405B
-    solutions are long). The TRL stack traced to:
+    Rationale: with Qwen3-1.7B vocab=151,936 and max_seq=4096, the
+    per-batch (B × T × V × 2B) eval-logits tensor — plus its contiguous
+    shift_logits copy inside compute_loss — exceeds A100-40GB headroom
+    whenever B>1 on pure-OMI2 (v3) data where every eval row is
+    token-dense (Llama3.1-405B solutions are long). Observed stack:
         trl/trainer/sft_trainer.py:1349  compute_loss
+        shift_logits = outputs.logits[..., :-1, :].contiguous()
         torch.OutOfMemoryError: Tried to allocate 13.77 GiB.
-    Setting eval_accumulation_steps>=4 makes Trainer move predictions to
-    CPU in chunks instead of accumulating one mega-tensor on GPU."""
+    eval_accumulation_steps alone is INSUFFICIENT — it only controls
+    cross-batch accumulator placement, not the per-batch allocation.
+    Both knobs target different memory ledgers and both must be set."""
     kw = _call_sft()
-    assert "eval_accumulation_steps" in kw, (
-        "eval_accumulation_steps must be set explicitly; the Trainer "
-        "default (None) gathers eval logits in a single allocation and "
-        "OOMs on long-sequence eval sets (v3 pure-OMI2)."
+    # Per-batch logits-allocation cap — the load-bearing fix.
+    assert "per_device_eval_batch_size" in kw, (
+        "per_device_eval_batch_size must be set explicitly to 1; the "
+        "Trainer default cascades from per_device_train_batch_size (4) "
+        "and OOMs on long-sequence v3 eval rows. See the OOM-fix comment "
+        "in scripts/train_sft.py:sft_config_kwargs."
     )
+    assert kw["per_device_eval_batch_size"] == 1, (
+        f"per_device_eval_batch_size={kw['per_device_eval_batch_size']}; "
+        "must be 1 — eval_accumulation_steps does not shrink the per-batch "
+        "logits tensor, only B=1 does."
+    )
+    # Cross-batch accumulator placement — complementary, not load-bearing.
+    assert "eval_accumulation_steps" in kw
     assert kw["eval_accumulation_steps"] >= 4, (
-        f"eval_accumulation_steps={kw['eval_accumulation_steps']} is "
-        "below the 4-chunk minimum required to fit v3 eval logits on "
-        "A100 40GB. If raising this still OOMs, also drop "
-        "per_device_eval_batch_size — see the OOM-fix notes in train_sft.py."
+        f"eval_accumulation_steps={kw['eval_accumulation_steps']}; raise "
+        "to >=4 so per-batch predictions are moved to CPU promptly rather "
+        "than accumulated on GPU across the full eval set."
     )
 
 
