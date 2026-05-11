@@ -26,6 +26,9 @@
 #   SCRATCH_USER  Same convention as submit_train.sh. Default: Julien
 #   REPO_DIR      Repo path inside the pod.
 #                 Default: /scratch/${SCRATCH_USER}/emainelpe_math_model
+#   DATA_OUT_DIR  Stage 1 SFT output dir; supplies train.jsonl as the
+#                 curation pool. Default: /scratch/${SCRATCH_USER}/data_out
+#                 Override for v2/v3, e.g. DATA_OUT_DIR=/scratch/Julien/data_out_v3
 #   ADAPTER_DIR   Trained SFT adapter dir to continue training from.
 #                 Default: /scratch/${SCRATCH_USER}/runs/cs552-erbland-g65-train-20260508-150203/final
 #   PROMPT_SET    Curated RLVR prompts JSONL produced by prepare_rlvr.py.
@@ -64,7 +67,7 @@ while (( $# )); do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     -h|--help)
-      sed -n '2,53p' "$0"
+      sed -n '2,56p' "$0"
       exit 0
       ;;
     -*)
@@ -99,7 +102,10 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 RUN_NAME="cs552-${GASPAR}-${GROUP}-${SUFFIX}-${TIMESTAMP}"
 REPO_DIR="${REPO_DIR:-/scratch/${SCRATCH_USER}/emainelpe_math_model}"
 
-DATA_OUT_DIR="/scratch/${SCRATCH_USER}/data_out"
+# DATA_OUT_DIR override semantics: set the env var to point at v2/v3 SFT
+# outputs (e.g. DATA_OUT_DIR=/scratch/Julien/data_out_v3) so prepare_rlvr.py
+# scores the matching pool. Matches the submit_train.sh:118 pattern.
+DATA_OUT_DIR="${DATA_OUT_DIR:-/scratch/${SCRATCH_USER}/data_out}"
 RUN_OUT_DIR="/scratch/${SCRATCH_USER}/runs/${RUN_NAME}"
 ADAPTER_DIR="${ADAPTER_DIR:-/scratch/${SCRATCH_USER}/runs/cs552-erbland-g65-train-20260508-150203/final}"
 PROMPT_SET="${PROMPT_SET:-${DATA_OUT_DIR}/rlvr_prompts.jsonl}"
@@ -173,6 +179,7 @@ if (( DRY_RUN )); then
   echo "RUN_NAME       : ${RUN_NAME}"
   echo "REPO_DIR       : ${REPO_DIR}"
   echo "IMAGE          : ${IMAGE}"
+  echo "DATA_OUT_DIR   : ${DATA_OUT_DIR}"
   echo "ADAPTER_DIR    : ${ADAPTER_DIR}"
   echo "PROMPT_SET     : ${PROMPT_SET}"
   echo "SFT_MODEL      : ${SFT_MODEL}"

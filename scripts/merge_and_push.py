@@ -248,7 +248,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hf-repo", default=DEFAULT_HF_REPO,
         help="HF repo to push to. Default: the team org repo.",
     )
-    p.add_argument("--temperature", type=float, default=0.3)
+    p.add_argument(
+        "--temperature", type=float, default=0.4,
+        help="Sampling temperature written into generation_config.json. "
+             "Default 0.4: the calibrated peak from the 2026-05-11 SFT "
+             "temperature sweep (v3 maximizes pass@8 here). See CLAUDE.md "
+             "→ 'Inference temperature' and docs/BASELINE.md → "
+             "'2026-05-11 SFT comparison and temperature sweep'.",
+    )
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=20)
     p.add_argument(

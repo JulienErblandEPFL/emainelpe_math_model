@@ -18,7 +18,7 @@ SCRIPT = REPO_ROOT / "rcp" / "submit_rlvr.sh"
 # every test so inherited values cannot influence the assembled command.
 SCRIPT_ENV_VARS = (
     "GASPAR", "GROUP", "HF_TOKEN", "WANDB_API_KEY",
-    "IMAGE", "SCRATCH_USER", "REPO_DIR",
+    "IMAGE", "SCRATCH_USER", "REPO_DIR", "DATA_OUT_DIR",
     "ADAPTER_DIR", "PROMPT_SET", "SFT_MODEL",
     "MAX_PROMPTS", "POOL_SIZE", "TARGET_SIZE",
     "LEARNING_RATE", "KL_COEF", "ROLLOUT_TEMP",
