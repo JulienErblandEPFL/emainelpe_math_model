@@ -160,3 +160,21 @@ ablation knob, not the headline reading.
   describes the public snapshot as a calibration tool; the CI's
   private set may differ in difficulty mix. Treat 0.4000 as the
   best available estimate, not a CI-grade promise.
+
+### Evidence trail (W&B run IDs)
+
+The runs behind the numbers above and the in-flight variant experiments
+share a single W&B project (`emainelpe-math`):
+
+- **v1 SFT (DART only, pushed to HF as `cs-552-2026-emainelpe/math_model`).**
+  W&B run id: `yazg1nth`. The four-row table above scores this checkpoint
+  against the bare-model rows.
+- **v2 SFT (mixed DART + OpenMathInstruct-2, 50/50).** RCP job:
+  `cs552-erbland-g65-v2-mixed-20260511-123452`. In flight at the time of
+  this writing (ETA ~17:30 on 2026-05-11). Re-baseline this section once
+  the v2 checkpoint is evaluated against the same `validation_samples/math.jsonl`
+  snapshot under ci-faithful caps.
+- **v3 SFT (pure OpenMathInstruct-2).** RCP job (third attempt, with the
+  eval-OOM mitigation in place): `cs552-erbland-g65-v3-omi2-fix2-20260511-152150`.
+  See `IMPLEMENTATION_PLAN.md` → "Lessons learned" for the OOM bug-fix
+  arc. Re-baseline when training finishes.

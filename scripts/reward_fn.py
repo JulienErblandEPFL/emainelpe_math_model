@@ -46,7 +46,12 @@ def compute_reward(generation: str, gold: str) -> float:
     same call site as ``evaluate.score.score_generations``.
     """
     extracted = extract_boxed_answer(generation, strip_double_curly_brace=True)
-    has_box = extracted is not None
+    # Require non-empty stripped payload so empty \boxed{} and \boxed{ }
+    # don't harvest the format reward without contributing an answer —
+    # would otherwise give GRPO a "give up, emit empty box" attractor
+    # at 0.05 per rollout. See scripts/tests/reward_fn_audit.md →
+    # "Empty-box gaming risk".
+    has_box = bool(extracted is not None and extracted.strip())
     correct = bool(has_box and is_equiv(extracted, gold))
     return CORRECTNESS_WEIGHT * float(correct) + FORMAT_WEIGHT * float(has_box)
 

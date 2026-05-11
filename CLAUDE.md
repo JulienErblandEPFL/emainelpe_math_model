@@ -68,6 +68,7 @@ Then in week 4 (team work, not part of this repo): DARE → AdaMerging merge.
 | SFT learning rate | 1e-4 | Standard for LoRA per TRL docs |
 | SFT epochs | 2 | Avoid overfit at r=32 |
 | Effective batch size | 32 (4 per-device × 8 grad-accum) | Fits A100 40GB |
+| Eval-time batch (Trainer) | `per_device_eval_batch_size=1`, `eval_accumulation_steps=4` | 2026-05-11 v3 OOM: pure-OMI2 eval rows are token-dense; the per-batch `(B × T × V × 2B)` logits tensor + its contiguous `shift_logits` copy in `compute_loss` requested 13.77 GiB on a 40 GB A100. `eval_accumulation_steps=4` ALONE is insufficient — it only chunks cross-batch accumulation, not the per-batch allocation. Both knobs needed. |
 | Sequence length | 4096 | Matches CI eval cap |
 | LR schedule | Cosine, 3% warmup | Standard |
 | Gradient checkpointing | ON | Memory headroom |

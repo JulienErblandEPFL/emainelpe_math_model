@@ -591,6 +591,67 @@ options only if the main path lands ahead of schedule.
 
 ---
 
+## Lessons learned
+
+### 2026-05-11 — v3 SFT eval-step OOM on A100 40 GB
+
+**Symptom.** v3 (pure OpenMathInstruct-2) training crashed twice during
+the first scheduled eval pass with identical stack traces:
+
+```
+File "trl/trainer/sft_trainer.py", line 1349, in compute_loss
+  shift_logits = outputs.logits[..., :-1, :].contiguous()
+torch.OutOfMemoryError: Tried to allocate 13.77 GiB.
+```
+
+The second attempt (after a first fix) survived longer — into step 500 /
+epoch 0.32 — but failed the same way.
+
+**Root cause.** The per-batch logits tensor at eval time is
+`B × T × V × 2 bytes`. For Qwen3-1.7B (`V = 151,936`) at `T = 4096` and
+the default `per_device_eval_batch_size = 4` (cascaded from the train
+batch), that is `~4.97 GiB` raw, and `compute_loss`'s
+`shift_logits = outputs.logits[..., :-1, :].contiguous()` materializes a
+second contiguous copy of nearly the same size, hitting the observed
+`~13.77 GiB` allocation peak. v2 (50/50 mixed DART+OMI2) survives the
+same eval step because half its eval rows are shorter DART sequences;
+v3's pure-OMI2 eval set is uniformly long (Llama3.1-405B-Instruct
+solutions tend to be verbose).
+
+Training itself does not OOM because gradient checkpointing caps the
+activation footprint and `loss.backward()` runs immediately; only the
+eval path explicitly materializes the full per-batch logits tensor for
+metric computation.
+
+**First fix attempt — INSUFFICIENT.** Set `eval_accumulation_steps=4`
+in `scripts/train_sft.py:sft_config_kwargs`. The hypothesis was that
+chunking the logits gather would help; in practice
+`eval_accumulation_steps` only controls how predictions are
+*accumulated across* eval batches (and when they are moved off-GPU). It
+does not reduce the per-batch logits allocation. Same stack trace
+recurred, just later in the eval pass.
+
+**Working fix.** Set `per_device_eval_batch_size=1` AND keep
+`eval_accumulation_steps=4`. With `B=1` the per-batch logits tensor is
+`~1.24 GiB` raw, `~2.5 GiB` peak through the contiguous copy. Both
+knobs are now committed to `sft_config_kwargs` and asserted in
+`scripts/tests/test_train_sft_config.py::test_sft_config_kwargs_eval_memory_caps_avoid_oom`.
+
+**Mitigation footprint.** The fix is in `sft_config_kwargs` (not the
+v3-specific submit path), so any future training with long-sequence
+data — including v2/v3 retries, v4 stretch experiments, RLVR rollouts
+on eval slices, anything reading from a long-OMI2-like distribution —
+inherits the same safety margin. The throughput cost is bounded: the
+held-out eval slice is 500 rows, evaluated once per 500 training steps,
+so even with `B=1` total eval wall-clock per pass is on the order of
+minutes — acceptable next to a multi-hour training run that would
+otherwise crash.
+
+**Source of truth for the constraint.** `CLAUDE.md` → "Settled design
+decisions" → "Eval-time batch (Trainer)" row.
+
+---
+
 ## Status — update at the end of each session
 
 ```

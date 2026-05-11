@@ -54,6 +54,33 @@ def test_no_box_even_with_correct_substring_returns_zero():
     assert compute_reward(gen, "4") == 0.0
 
 
+def test_empty_box_returns_zero_not_format_reward():
+    """``\\boxed{}`` MUST score 0.0, not 0.05.
+
+    ``extract_boxed_answer`` returns the empty string (not None) when
+    the model emits an empty box, which would naively trip
+    ``has_box=True`` and harvest the 0.05 format reward without any
+    answer content. Under GRPO that is a free 0.05/rollout attractor:
+    a policy that learns to give up by emitting ``\\boxed{}`` gets
+    rewarded for it. The reward function must explicitly require
+    non-empty stripped payload. See scripts/tests/reward_fn_audit.md
+    → "Empty-box gaming risk"."""
+    gen = "<think>I'm not sure</think>\n\n\\boxed{}"
+    assert compute_reward(gen, "42") == 0.0
+
+
+def test_whitespace_only_box_returns_zero_not_format_reward():
+    """``\\boxed{ }`` MUST score 0.0 — same gaming-risk as the empty
+    box, just with whitespace inside. ``extract_boxed_answer`` returns
+    ``" "`` (the literal space) which would naively trip ``has_box``.
+
+    Stripped-payload check must catch this. Also defends against
+    ``\\boxed{\\n}`` and ``\\boxed{\\t}``, which are the same semantic
+    case in different lexical clothing."""
+    gen = "<think>...</think>\n\n\\boxed{ }"
+    assert compute_reward(gen, "42") == 0.0
+
+
 # =============================================================================
 # is_equiv passthrough — corner cases CI handles via aggressive normalization.
 # These prove the reward delegates to evaluate.is_equiv rather than a
