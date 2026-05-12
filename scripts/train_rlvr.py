@@ -217,24 +217,34 @@ def grpo_config_kwargs(
     }
 
 
-# Same marker as data/prepare_rlvr.CHAT_TEMPLATE_OPEN_MARKER. Re-declared
-# here so the runtime sanity check doesn't pull data/ into the import
-# graph (data/prepare_rlvr imports vllm-via-deferred-paths only, but
-# keeping train_rlvr self-contained reduces cross-module coupling).
+# Same markers as data/prepare_rlvr (intentionally re-declared so the
+# runtime sanity check doesn't pull data/ into the import graph). Keep
+# in sync with data/prepare_rlvr.CHAT_TEMPLATE_OPEN_MARKER / THINK_PREFIX.
 CHAT_TEMPLATE_OPEN_MARKER = "<|im_start|>"
+THINK_PREFIX = "<think>\n"
 
 
 def assert_prompts_are_chat_templated(
     prompts: list[dict], *, sample_size: int = 5
 ) -> None:
-    """Defend against the 2026-05-12 retry2 incident.
+    """Defend against the 2026-05-12 retry2 and retry3 incidents.
 
-    Curated prompts MUST be chat-templated strings (output of
-    ``tokenizer.apply_chat_template(..., add_generation_prompt=True)``).
-    Raw problem text causes GRPO rollouts to never emit ``<|im_end|>``,
-    100% hit the token cap, and collapse ``reward_std`` to 0. We check
-    the first ``sample_size`` prompts and raise with a precise pointer
-    to ``data/prepare_rlvr.build_scored_row`` if any look raw.
+    Curated prompts MUST satisfy two invariants:
+
+      1. ``CHAT_TEMPLATE_OPEN_MARKER`` present — the prompt is the
+         output of ``tokenizer.apply_chat_template(...)``, not raw
+         text. Raw text → no ``<|im_end|>`` → 100% token-cap clipping
+         → ``reward_std`` collapses to 0 (retry2, 2026-05-12).
+      2. Prompt ends with ``THINK_PREFIX`` — the v3 SFT model was
+         trained on assistant turns starting with ``<think>\\n``, but
+         the locked chat template's generation prompt omits it.
+         Without this prefix, rollouts at temp=0.8 sometimes skip
+         ``<think>``, drop out of the trained regime, and never
+         terminate (retry3, 2026-05-12).
+
+    We check the first ``sample_size`` prompts and raise with a
+    precise pointer to ``data/prepare_rlvr.build_scored_row`` if any
+    fail either invariant.
     """
     if not prompts:
         return
@@ -250,6 +260,19 @@ def assert_prompts_are_chat_templated(
                 f"GRPO (see 2026-05-12 retry2 incident). Re-run "
                 f"data/prepare_rlvr.py with the post-2026-05-12 fix "
                 f"to regenerate rlvr_prompts.jsonl."
+            )
+        if not prompt.endswith(THINK_PREFIX):
+            preview_tail = prompt[-120:].replace("\n", "\\n")
+            raise RuntimeError(
+                f"Prompt set is missing the {THINK_PREFIX!r} suffix. "
+                f"Row {idx} ends with: {preview_tail!r}. The v3 SFT "
+                f"model was trained on assistant turns starting with "
+                f"'<think>\\n', but the chat template's generation "
+                f"prompt does NOT emit it. Without this suffix, "
+                f"rollouts at temp=0.8 unreliably skip <think> and "
+                f"never terminate (see 2026-05-12 retry3 incident). "
+                f"Re-run data/prepare_rlvr.py — build_scored_row "
+                f"enforces the suffix at curation time."
             )
 
 

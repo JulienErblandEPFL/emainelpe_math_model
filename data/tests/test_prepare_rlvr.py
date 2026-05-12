@@ -26,6 +26,7 @@ from prepare_rlvr import (
     CHAT_TEMPLATE_OPEN_MARKER,
     DIFFICULTY_HI,
     DIFFICULTY_LO,
+    THINK_PREFIX,
     _parse_args,
     build_scored_row,
     difficulty_filter,
@@ -286,14 +287,24 @@ def test_write_jsonl_creates_parent_dir(tmp_path: Path):
 # accept a prompt that's missing the chat-open marker.
 # =============================================================================
 
+# Chat-template wrap + THINK_PREFIX. Mirrors what the locked
+# chat_template/chat_template.jinja produces with add_generation_prompt=True,
+# plus the "<think>\n" appended by prepare_rlvr.main().
 _TEMPLATED_PROMPT = (
     "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
     "<|im_start|>assistant\n<think>\n"
 )
+# Bare chat-template output — what apply_chat_template() alone produces.
+# Has the chat wrap, but NO <think>\n suffix. This is the 2026-05-12
+# retry3 bug shape.
+_TEMPLATED_NO_THINK = (
+    "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
 
 
 def test_build_scored_row_writes_templated_prompt():
-    """Happy path — output row contains the templated prompt verbatim."""
+    """Happy path — output row contains the templated + <think> prompt."""
     out = build_scored_row(
         rendered_prompt=_TEMPLATED_PROMPT,
         gold="4",
@@ -302,18 +313,13 @@ def test_build_scored_row_writes_templated_prompt():
     )
     assert out["prompt"] == _TEMPLATED_PROMPT
     assert CHAT_TEMPLATE_OPEN_MARKER in out["prompt"]
+    assert out["prompt"].endswith(THINK_PREFIX)
     assert out["answer"] == "4"
     assert out["solve_rate"] == 3 / 8
 
 
 def test_build_scored_row_rejects_raw_prompt():
-    """Defensive guard — raw (unwrapped) prompts must raise.
-
-    This catches the 2026-05-12 bug class at the point of construction:
-    if a future code edit forgets to apply the chat template before
-    handing the prompt to build_scored_row, the curation script fails
-    loudly instead of silently writing degenerate rows.
-    """
+    """Defensive guard — raw (unwrapped) prompts must raise (retry2)."""
     raw_problem = r"Let $\mathbf{a} = \langle x, y\rangle$. Find ..."
     assert CHAT_TEMPLATE_OPEN_MARKER not in raw_problem
     with pytest.raises(ValueError, match="chat-template marker"):
@@ -325,10 +331,29 @@ def test_build_scored_row_rejects_raw_prompt():
         )
 
 
+def test_build_scored_row_rejects_templated_but_no_think_prefix():
+    """Defensive guard — bare chat-template output must raise (retry3).
+
+    The 2026-05-12 retry3 incident: prompts had ``<|im_start|>`` but
+    ended at ``<|im_start|>assistant\\n`` without ``<think>\\n``. The
+    v3 SFT model was trained on assistant turns that begin with
+    <think>, so missing this suffix causes rollouts to unreliably
+    drop the think token, run off-distribution, and never terminate."""
+    assert CHAT_TEMPLATE_OPEN_MARKER in _TEMPLATED_NO_THINK
+    assert not _TEMPLATED_NO_THINK.endswith(THINK_PREFIX)
+    with pytest.raises(ValueError, match=r"<think>"):
+        build_scored_row(
+            rendered_prompt=_TEMPLATED_NO_THINK,
+            gold="4",
+            n_correct=3,
+            n_rollouts=8,
+        )
+
+
 def test_build_scored_row_round_trips_through_write_jsonl(tmp_path: Path):
     """End-to-end: a row built via build_scored_row → written → re-read
-    must still carry the chat-template marker. Pins the on-disk schema
-    that scripts/train_rlvr.py P1 sanity check relies on."""
+    must still carry BOTH the chat-template marker AND the THINK_PREFIX.
+    Pins the on-disk schema that scripts/train_rlvr.py P0 check relies on."""
     row = build_scored_row(
         rendered_prompt=_TEMPLATED_PROMPT,
         gold="4",
@@ -339,6 +364,7 @@ def test_build_scored_row_round_trips_through_write_jsonl(tmp_path: Path):
     write_jsonl([row], out)
     reread = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
     assert CHAT_TEMPLATE_OPEN_MARKER in reread["prompt"]
+    assert reread["prompt"].endswith(THINK_PREFIX)
     assert reread["solve_rate"] == 0.5
 
 

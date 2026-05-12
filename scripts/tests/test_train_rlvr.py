@@ -31,6 +31,7 @@ from scripts.train_rlvr import (
     KL_SPIKE_THRESHOLD,
     KL_SPIKE_WINDOW_STEPS,
     REWARD_VARIANCE_THRESHOLD,
+    THINK_PREFIX,
     _is_kl_spike,
     _parse_args,
     assert_prompts_are_chat_templated,
@@ -354,10 +355,20 @@ _RAW_ROW = {
     "prompt": r"Let $\mathbf{a} = \langle x, y\rangle$. Compute ...",
     "answer": "42",
 }
+# Chat-templated but missing the THINK_PREFIX — the 2026-05-12 retry3
+# bug shape. Has <|im_start|> wrapping but ends at ``assistant\n``.
+_NO_THINK_ROW = {
+    "prompt": (
+        "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    ),
+    "answer": "4",
+}
 
 
 def test_assert_prompts_are_chat_templated_accepts_templated_prompts():
     assert CHAT_TEMPLATE_OPEN_MARKER in _TEMPLATED_ROW["prompt"]
+    assert _TEMPLATED_ROW["prompt"].endswith(THINK_PREFIX)
     # No exception.
     assert_prompts_are_chat_templated([_TEMPLATED_ROW, _TEMPLATED_ROW])
 
@@ -365,6 +376,16 @@ def test_assert_prompts_are_chat_templated_accepts_templated_prompts():
 def test_assert_prompts_are_chat_templated_rejects_raw_prompts():
     with pytest.raises(RuntimeError, match="NOT chat-templated"):
         assert_prompts_are_chat_templated([_RAW_ROW])
+
+
+def test_assert_prompts_are_chat_templated_rejects_no_think_prefix():
+    """Retry3 incident — chat-templated but missing the <think>\\n
+    suffix. The model needs the prefix to stay in the trained regime;
+    without it, rollouts at temp=0.8 drop <think> and never terminate."""
+    assert CHAT_TEMPLATE_OPEN_MARKER in _NO_THINK_ROW["prompt"]
+    assert not _NO_THINK_ROW["prompt"].endswith(THINK_PREFIX)
+    with pytest.raises(RuntimeError, match=r"<think>"):
+        assert_prompts_are_chat_templated([_NO_THINK_ROW])
 
 
 def test_assert_prompts_are_chat_templated_empty_list_is_noop():

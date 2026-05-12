@@ -10,9 +10,11 @@ Input  : Stage 1's ``train.jsonl`` (``{"messages": [user, assistant]}``).
 Output : RLVR prompt JSONL (``{"prompt", "answer", "solve_rate"}``).
          As of 2026-05-12 the ``prompt`` field is the *chat-templated*
          string the model expects (output of
-         ``tokenizer.apply_chat_template(..., add_generation_prompt=True)``),
-         NOT the raw problem text — see the 2026-05-12 retry2 incident
-         and ``build_scored_row`` for the rationale.
+         ``tokenizer.apply_chat_template(..., add_generation_prompt=True)``)
+         WITH the ``<think>\\n`` prefix appended — NOT the raw problem
+         text and NOT the bare chat-template output. See the 2026-05-12
+         retry2 and retry3 incidents and ``build_scored_row`` for the
+         rationale.
 
 Pure helpers (``difficulty_filter``, ``extract_prompt_and_gold``,
 ``validate_pool_row``, ``solve_rate``) are CPU-testable and live at
@@ -118,12 +120,23 @@ def extract_prompt_and_gold(messages: list[dict]) -> tuple[str, str] | None:
     return prompt, gold
 
 
-# Marker that the locked chat_template (chat_template/chat_template.jinja)
-# always emits. Used to defend against the 2026-05-12 degenerate-rollout
-# bug class: writing raw prompts (no chat wrapping) to rlvr_prompts.jsonl
-# made GRPO rollouts run on unwrapped text, never emit <|im_end|>, and
-# hit the token cap at 100% with zero reward variance.
+# Markers required on every prompt written to rlvr_prompts.jsonl.
+#
+# CHAT_TEMPLATE_OPEN_MARKER: the locked chat_template's <|im_start|>
+#   wrapper. Defends against the 2026-05-12 retry2 incident, where raw
+#   unwrapped prompts caused GRPO rollouts to never emit <|im_end|>.
+#
+# THINK_PREFIX: the v3 SFT model was trained on assistant turns that
+#   BEGIN with "<think>\n". The locked chat template emits the
+#   generation prompt as "<|im_start|>assistant\n" with NO <think>
+#   prefix (chat_template.jinja:56-62 — the <think>...\n branch only
+#   fires when enable_thinking=false, which the template forces to
+#   true). At rollout temp=0.8 the model unreliably emits <think>
+#   itself, dropping out of the trained regime → reward_std=0 again.
+#   We append <think>\n directly to force the model into the expected
+#   reasoning regime.
 CHAT_TEMPLATE_OPEN_MARKER = "<|im_start|>"
+THINK_PREFIX = "<think>\n"
 
 
 def build_scored_row(
@@ -136,13 +149,15 @@ def build_scored_row(
     """Assemble one curated output row for ``rlvr_prompts.jsonl``.
 
     ``rendered_prompt`` MUST be the *chat-templated* string (output of
-    ``tokenizer.apply_chat_template(..., add_generation_prompt=True)``),
-    not the raw problem text. GRPO rollouts during Stage 7 training feed
-    this string straight into the model — so unwrapped prompts produce
-    degenerate generations (no ``<|im_end|>`` emitted, 100% hit the
-    token cap, reward_std collapses to 0). This helper enforces the
-    invariant: if the marker is missing it raises immediately rather
-    than letting the training crash silently 10h later.
+    ``tokenizer.apply_chat_template(..., add_generation_prompt=True)``)
+    with the ``<think>\\n`` prefix appended — not the raw problem text
+    and not the bare chat-template output. GRPO rollouts during Stage 7
+    feed this string straight into the model; if either piece is
+    missing the rollouts go degenerate (no ``<|im_end|>`` emitted, 100%
+    hit the token cap, ``reward_std`` collapses to 0). This helper
+    enforces the invariant: if a marker is missing it raises
+    immediately rather than letting the training crash silently 10h
+    later.
     """
     if CHAT_TEMPLATE_OPEN_MARKER not in rendered_prompt:
         raise ValueError(
@@ -150,6 +165,15 @@ def build_scored_row(
             f"{CHAT_TEMPLATE_OPEN_MARKER!r}; pass the output of "
             f"tokenizer.apply_chat_template(...) here, not the raw "
             f"problem text. (See 2026-05-12 RLVR retry2 incident.)"
+        )
+    if not rendered_prompt.endswith(THINK_PREFIX):
+        raise ValueError(
+            f"rendered_prompt is missing the {THINK_PREFIX!r} prefix at "
+            f"the end. The v3 SFT model was trained on assistant turns "
+            f"that begin with '<think>\\n'; the chat template's "
+            f"add_generation_prompt branch does NOT emit this token. "
+            f"Append it after apply_chat_template(). (See 2026-05-12 "
+            f"RLVR retry3 incident.)"
         )
     return {
         "prompt": rendered_prompt,
@@ -372,12 +396,17 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
     )
 
+    # THINK_PREFIX is appended after apply_chat_template() because the
+    # locked chat template's add_generation_prompt branch ends at
+    # "<|im_start|>assistant\n" with no <think> token — but the v3 SFT
+    # model was trained on assistant turns that begin with <think>\n.
+    # See module docstring and 2026-05-12 retry3 incident.
     rendered_prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": row["prompt"]}],
             tokenize=False,
             add_generation_prompt=True,
-        )
+        ) + THINK_PREFIX
         for row in pool
     ]
 
