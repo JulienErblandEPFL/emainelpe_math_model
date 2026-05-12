@@ -174,11 +174,13 @@ def grpo_config_kwargs(
     Prompt vs. completion budget. ``yaml_dict["max_seq_length"]=4096``
     is the SFT *training* sequence cap, not Qwen3-1.7B's hard context
     (which is ~32k). For RLVR rollouts we keep ``max_completion_length``
-    pinned at the CI ``max_tokens=4096`` to mirror eval, and allocate a
-    separate ``max_prompt_length`` budget on top — combined sequences may
-    exceed 4096 during training but stay under Qwen3-1.7B's context. CI
-    behavior at eval time still re-imposes the combined 4096 cap; that's
-    a Stage 4 concern, not a training one.
+    pinned at the CI ``max_tokens=4096`` to mirror eval. The previously-
+    set ``max_prompt_length`` knob was dropped on 2026-05-12 because the
+    course-image TRL 0.19.1 ``GRPOConfig.__init__`` rejects it as an
+    unexpected keyword argument (verified via ``inspect.signature``).
+    Prompt-length truncation now defers to the tokenizer's own limits,
+    which is fine — the curated math prompts are comfortably short (the
+    ``--max-prompt-length`` v0 default of 1024 was never tight).
 
     ``per_device_train_batch_size`` here is *prompts per step*, not
     rollouts; total trajectories per gradient update is
@@ -193,7 +195,8 @@ def grpo_config_kwargs(
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "lr_scheduler_type": "cosine",
         "warmup_ratio": 0.03,
-        "max_prompt_length": args.max_prompt_length,
+        # NOTE: max_prompt_length intentionally omitted — TRL 0.19.1's
+        # GRPOConfig rejects it. See docstring above.
         "max_completion_length": args.max_new_tokens,
         "num_generations": args.num_generations,
         "temperature": args.rollout_temp,
@@ -308,10 +311,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Cap on prompt-set rows used (one epoch).")
     p.add_argument("--max-new-tokens", type=int, default=4096,
                    help="Per-rollout token budget; matches CI max_tokens=4096.")
-    p.add_argument("--max-prompt-length", type=int, default=1024,
-                   help="Cap on prompt token length passed to GRPO. Math "
-                        "prompts comfortably fit under 1024 tokens; raise if "
-                        "the curated set surfaces longer inputs.")
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=8)
     p.add_argument("--epochs", type=int, default=1)

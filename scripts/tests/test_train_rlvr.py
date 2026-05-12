@@ -253,12 +253,10 @@ def test_grpo_config_kwargs_passes_d5_defaults():
     assert out["bf16"] is True
     assert out["fp16"] is False
     assert out["report_to"] == "none"
-    # Default --max-prompt-length=1024 leaves 4096 tokens of completion
-    # room. Combined sequence (5120) exceeds the SFT max_seq_length=4096
-    # but stays well under Qwen3-1.7B's actual ~32k context — see the
-    # docstring on grpo_config_kwargs for why the SFT-era cap doesn't
-    # bind RLVR rollouts.
-    assert out["max_prompt_length"] == 1024
+    # max_prompt_length intentionally absent — TRL 0.19.1's GRPOConfig
+    # rejects it (verified empirically on the course image 2026-05-12).
+    # Prompt-length truncation defers to the tokenizer's own limits.
+    assert "max_prompt_length" not in out
 
 
 def test_grpo_config_kwargs_fp16_path():
@@ -278,6 +276,54 @@ def test_grpo_config_kwargs_wandb_routing():
         run_name="rlvr-test", use_wandb=True,
     )
     assert out["report_to"] == "wandb"
+
+
+# =============================================================================
+# TRL API drift — instantiate GRPOConfig with the actual kwargs.
+#
+# The 2026-05-12 RLVR pod crash was a silent API-drift bug: TRL 0.19.1
+# rejected the ``max_prompt_length`` kwarg that grpo_config_kwargs() had
+# always returned. The dict-shape test above pins the *absence* of
+# max_prompt_length, but only a real GRPOConfig(**kwargs) call can catch
+# future drift on other kwargs. We gate on importorskip so the test
+# runs in any environment where TRL is installed (CI, RCP pod) and is
+# silently skipped on the user's CPU-only laptop.
+# =============================================================================
+
+def test_grpoconfig_accepts_all_kwargs(tmp_path: Path):
+    """Every key in ``grpo_config_kwargs()`` must be a valid GRPOConfig
+    ``__init__`` parameter.
+
+    Skipped on environments where TRL is not installed (e.g., the user's
+    laptop). On the course image (TRL 0.19.1) and any future-version
+    pod, this test fires and would have caught the 2026-05-12
+    ``max_prompt_length`` regression before the pod ran.
+
+    We deliberately compare against ``inspect.signature(...).parameters``
+    instead of attempting full ``GRPOConfig(**kwargs)`` instantiation
+    because the latter triggers ``transformers.TrainingArguments``
+    runtime checks (bf16-requires-GPU, etc.) that fail on CPU-only dev
+    boxes — those are environment validations, not API-drift signals.
+    """
+    import inspect
+    trl = pytest.importorskip("trl")
+    valid_params = set(
+        inspect.signature(trl.GRPOConfig.__init__).parameters.keys()
+    )
+
+    args = _parse_args(["--output-dir", str(tmp_path)])
+    kwargs = grpo_config_kwargs(
+        args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
+        run_name="rlvr-test", use_wandb=False,
+    )
+    unexpected = set(kwargs.keys()) - valid_params
+    assert not unexpected, (
+        f"grpo_config_kwargs() emits keys that TRL "
+        f"{getattr(trl, '__version__', '?')} GRPOConfig rejects: "
+        f"{sorted(unexpected)}. The 2026-05-12 crash had "
+        f"{{'max_prompt_length'}} here — fix grpo_config_kwargs to use "
+        f"the current TRL kwarg names."
+    )
 
 
 # =============================================================================
