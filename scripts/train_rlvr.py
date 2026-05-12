@@ -50,6 +50,15 @@ import yaml
 logger = logging.getLogger("train_rlvr")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Put repo root on sys.path so ``from scripts.reward_fn import ...`` and
+# ``from evaluate.X import ...`` work whether the script is invoked via
+# ``python scripts/train_rlvr.py`` (which prepends scripts/ to sys.path,
+# hiding the scripts package) or ``python -m scripts.train_rlvr``. Same
+# idiom as scripts/eval_local.py and data/prepare_rlvr.py.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 DEFAULT_LORA_YAML = REPO_ROOT / "configs" / "lora.yaml"
 DEFAULT_CHAT_TEMPLATE = REPO_ROOT / "chat_template" / "chat_template.jinja"
 

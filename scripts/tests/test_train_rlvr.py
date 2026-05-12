@@ -13,11 +13,15 @@ Coverage:
   - validate_max_new_tokens (advisory warnings, no exception)
   - grpo_config_kwargs (locked values match D5)
   - default_run_name (shape only — string includes timestamp + 'rlvr-' prefix)
+  - sys.path bootstrap (regression: ``python scripts/train_rlvr.py --help``
+    must succeed because P2 imports ``scripts.reward_fn`` at runtime)
 """
 from __future__ import annotations
 
 import datetime as _dt
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -283,3 +287,84 @@ def test_grpo_config_kwargs_wandb_routing():
 def test_default_run_name_shape():
     name = default_run_name(now=_dt.datetime(2026, 5, 9, 14, 30))
     assert name == "rlvr-20260509-1430"
+
+
+# =============================================================================
+# sys.path bootstrap regression — exercises script-mode import resolution.
+#
+# RLVR run on 2026-05-12 crashed at preflight P2 with:
+#   ModuleNotFoundError: No module named 'scripts'
+# because ``python scripts/train_rlvr.py`` puts scripts/ (not the repo
+# root) on sys.path, so the deferred ``from scripts.reward_fn import
+# compute_reward`` at line 399 / 649 could not resolve. The fix is the
+# canonical sys.path.insert snippet at the top of train_rlvr.py — same
+# idiom as eval_local.py and prepare_rlvr.py.
+#
+# This test catches the regression cheaply: ``--help`` exits before any
+# GPU/TRL/torch code runs, but still triggers module-level imports.
+# =============================================================================
+
+def test_script_mode_help_succeeds_without_importerror():
+    """``python scripts/train_rlvr.py --help`` must exit 0.
+
+    Runs from the repo root so the invocation matches how submit_rlvr.sh
+    launches it on the cluster. ``--help`` short-circuits past the heavy
+    ML imports — we are only proving that the module-level imports +
+    sys.path bootstrap don't blow up.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "scripts" / "train_rlvr.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"exit={result.returncode}\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    assert "ModuleNotFoundError" not in result.stderr
+    # argparse --help output should mention at least one D5 flag.
+    assert "--learning-rate" in result.stdout
+
+
+def test_deferred_scripts_reward_fn_import_resolves_in_script_mode():
+    """Direct regression test for the 2026-05-12 P2 crash.
+
+    Simulates ``python scripts/train_rlvr.py`` (which puts ``scripts/``
+    on sys.path[0] but NOT the repo root), then loads train_rlvr.py via
+    importlib so its module body — including the sys.path bootstrap —
+    runs. After that, the deferred ``from scripts.reward_fn import
+    compute_reward`` used inside ``reward_variance_preflight_p2`` must
+    resolve. If anyone removes the sys.path snippet at the top of
+    train_rlvr.py, this test fails with ModuleNotFoundError.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    inline = (
+        "import sys, pathlib, importlib.util\n"
+        f"repo = pathlib.Path({str(repo_root)!r})\n"
+        # Mimic `python scripts/train_rlvr.py`: scripts/ on sys.path,
+        # repo root deliberately absent.
+        "sys.path.insert(0, str(repo / 'scripts'))\n"
+        "spec = importlib.util.spec_from_file_location("
+        "'train_rlvr', str(repo / 'scripts' / 'train_rlvr.py'))\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        # The deferred import that crashed on 2026-05-12 at P2.
+        "from scripts.reward_fn import compute_reward\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", inline],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"exit={result.returncode}\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    assert "ModuleNotFoundError" not in result.stderr
+    assert result.stdout.strip().endswith("OK")
