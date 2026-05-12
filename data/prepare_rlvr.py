@@ -8,6 +8,11 @@ GRPO has both a learning signal (positive rewards exist) and headroom
 
 Input  : Stage 1's ``train.jsonl`` (``{"messages": [user, assistant]}``).
 Output : RLVR prompt JSONL (``{"prompt", "answer", "solve_rate"}``).
+         As of 2026-05-12 the ``prompt`` field is the *chat-templated*
+         string the model expects (output of
+         ``tokenizer.apply_chat_template(..., add_generation_prompt=True)``),
+         NOT the raw problem text — see the 2026-05-12 retry2 incident
+         and ``build_scored_row`` for the rationale.
 
 Pure helpers (``difficulty_filter``, ``extract_prompt_and_gold``,
 ``validate_pool_row``, ``solve_rate``) are CPU-testable and live at
@@ -111,6 +116,46 @@ def extract_prompt_and_gold(messages: list[dict]) -> tuple[str, str] | None:
     if gold is None:
         return None
     return prompt, gold
+
+
+# Marker that the locked chat_template (chat_template/chat_template.jinja)
+# always emits. Used to defend against the 2026-05-12 degenerate-rollout
+# bug class: writing raw prompts (no chat wrapping) to rlvr_prompts.jsonl
+# made GRPO rollouts run on unwrapped text, never emit <|im_end|>, and
+# hit the token cap at 100% with zero reward variance.
+CHAT_TEMPLATE_OPEN_MARKER = "<|im_start|>"
+
+
+def build_scored_row(
+    *,
+    rendered_prompt: str,
+    gold: str,
+    n_correct: int,
+    n_rollouts: int,
+) -> dict:
+    """Assemble one curated output row for ``rlvr_prompts.jsonl``.
+
+    ``rendered_prompt`` MUST be the *chat-templated* string (output of
+    ``tokenizer.apply_chat_template(..., add_generation_prompt=True)``),
+    not the raw problem text. GRPO rollouts during Stage 7 training feed
+    this string straight into the model — so unwrapped prompts produce
+    degenerate generations (no ``<|im_end|>`` emitted, 100% hit the
+    token cap, reward_std collapses to 0). This helper enforces the
+    invariant: if the marker is missing it raises immediately rather
+    than letting the training crash silently 10h later.
+    """
+    if CHAT_TEMPLATE_OPEN_MARKER not in rendered_prompt:
+        raise ValueError(
+            f"rendered_prompt is missing the chat-template marker "
+            f"{CHAT_TEMPLATE_OPEN_MARKER!r}; pass the output of "
+            f"tokenizer.apply_chat_template(...) here, not the raw "
+            f"problem text. (See 2026-05-12 RLVR retry2 incident.)"
+        )
+    return {
+        "prompt": rendered_prompt,
+        "answer": gold,
+        "solve_rate": solve_rate(n_correct, n_rollouts),
+    }
 
 
 def validate_pool_row(row: dict, line_no: int) -> list[dict]:
@@ -352,19 +397,24 @@ def main(argv: list[str] | None = None) -> int:
         return 5
 
     scored: list[dict] = []
-    for row, out in zip(pool, outputs):
+    for row, rendered, out in zip(pool, rendered_prompts, outputs):
         completions = [c.text for c in out.outputs]
         rewards = [compute_reward(c, row["answer"]) for c in completions]
         # solve_rate uses correctness only — format-only rewards (0.05) do
         # NOT count as solves. Otherwise the band would skew toward boxing
         # garbage rather than actually solving.
         n_correct = sum(1 for r in rewards if r >= 1.0)
-        rate = solve_rate(n_correct, args.num_generations)
-        scored.append({
-            "prompt": row["prompt"],
-            "answer": row["answer"],
-            "solve_rate": rate,
-        })
+        # The written 'prompt' field is the CHAT-TEMPLATED string, not
+        # the raw problem. GRPO rollouts during Stage 7 send this string
+        # verbatim to the model; raw prompts cause degenerate generation
+        # (see 2026-05-12 retry2 incident → 100% token-cap clipping,
+        # reward_std=0). build_scored_row enforces this invariant.
+        scored.append(build_scored_row(
+            rendered_prompt=rendered,
+            gold=row["answer"],
+            n_correct=n_correct,
+            n_rollouts=args.num_generations,
+        ))
 
     logger.info("Scoring done; applying difficulty filter [%.2f, %.2f]",
                 args.difficulty_lo, args.difficulty_hi)

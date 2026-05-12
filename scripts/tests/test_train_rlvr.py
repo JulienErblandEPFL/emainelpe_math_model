@@ -27,11 +27,13 @@ from pathlib import Path
 import pytest
 
 from scripts.train_rlvr import (
+    CHAT_TEMPLATE_OPEN_MARKER,
     KL_SPIKE_THRESHOLD,
     KL_SPIKE_WINDOW_STEPS,
     REWARD_VARIANCE_THRESHOLD,
     _is_kl_spike,
     _parse_args,
+    assert_prompts_are_chat_templated,
     check_reward_variance,
     default_run_name,
     grpo_config_kwargs,
@@ -333,6 +335,54 @@ def test_grpoconfig_accepts_all_kwargs(tmp_path: Path):
 def test_default_run_name_shape():
     name = default_run_name(now=_dt.datetime(2026, 5, 9, 14, 30))
     assert name == "rlvr-20260509-1430"
+
+
+# =============================================================================
+# Chat-template sanity check — defends against the 2026-05-12 retry2
+# degenerate-rollout incident (raw prompts → 100% token-cap clipping →
+# reward_std=0 → no learning signal).
+# =============================================================================
+
+_TEMPLATED_ROW = {
+    "prompt": (
+        "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"
+    ),
+    "answer": "4",
+}
+_RAW_ROW = {
+    "prompt": r"Let $\mathbf{a} = \langle x, y\rangle$. Compute ...",
+    "answer": "42",
+}
+
+
+def test_assert_prompts_are_chat_templated_accepts_templated_prompts():
+    assert CHAT_TEMPLATE_OPEN_MARKER in _TEMPLATED_ROW["prompt"]
+    # No exception.
+    assert_prompts_are_chat_templated([_TEMPLATED_ROW, _TEMPLATED_ROW])
+
+
+def test_assert_prompts_are_chat_templated_rejects_raw_prompts():
+    with pytest.raises(RuntimeError, match="NOT chat-templated"):
+        assert_prompts_are_chat_templated([_RAW_ROW])
+
+
+def test_assert_prompts_are_chat_templated_empty_list_is_noop():
+    """Empty prompt sets are blocked earlier in main() with a clearer
+    error; this helper should not double-fire on empty input."""
+    assert_prompts_are_chat_templated([])
+
+
+def test_assert_prompts_are_chat_templated_samples_only_first_n():
+    """A long valid prefix followed by a stray raw row beyond sample_size
+    should not trip the check (we trust the curation invariant on the
+    bulk of the file; the sanity check is a cheap pre-GPU smoke)."""
+    rows = [_TEMPLATED_ROW] * 5 + [_RAW_ROW]
+    # Default sample_size=5 — raw row at idx 5 is beyond the window.
+    assert_prompts_are_chat_templated(rows)
+    # But with sample_size=6 the raw row is in scope and trips.
+    with pytest.raises(RuntimeError, match="NOT chat-templated"):
+        assert_prompts_are_chat_templated(rows, sample_size=6)
 
 
 # =============================================================================

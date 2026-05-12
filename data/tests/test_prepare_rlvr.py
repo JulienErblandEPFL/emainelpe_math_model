@@ -10,6 +10,9 @@ CPU-only. The heavy ML imports (``vllm``, ``transformers``) live inside
   - load_pool_jsonl     end-to-end JSONL load + max_rows cap.
   - write_jsonl         round-trip on a tmp file.
   - solve_rate          arithmetic + zero-rollout guard.
+  - build_scored_row    (2026-05-12 fix): output rows MUST contain a
+                        chat-templated prompt — defense against the
+                        degenerate-rollout incident.
   - CLI parsing         required defaults, mutually-consistent flags.
 """
 from __future__ import annotations
@@ -20,9 +23,11 @@ from pathlib import Path
 import pytest
 
 from prepare_rlvr import (
+    CHAT_TEMPLATE_OPEN_MARKER,
     DIFFICULTY_HI,
     DIFFICULTY_LO,
     _parse_args,
+    build_scored_row,
     difficulty_filter,
     extract_prompt_and_gold,
     load_pool_jsonl,
@@ -267,6 +272,74 @@ def test_write_jsonl_creates_parent_dir(tmp_path: Path):
     n = write_jsonl([{"x": 1}], out)
     assert n == 1
     assert out.is_file()
+
+
+# =============================================================================
+# build_scored_row — chat-template invariant (2026-05-12 incident).
+#
+# The retry2 RLVR run on 2026-05-12 trained for hours with reward_std=0,
+# 100% of rollouts hitting the 4096-token cap, because the output rows
+# had RAW prompts instead of chat-templated ones. GRPO fed the raw
+# strings to the model, which never emitted <|im_end|>. This helper +
+# its tests are the bug-class guard: any future code path that builds
+# an output row must go through build_scored_row, which refuses to
+# accept a prompt that's missing the chat-open marker.
+# =============================================================================
+
+_TEMPLATED_PROMPT = (
+    "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
+    "<|im_start|>assistant\n<think>\n"
+)
+
+
+def test_build_scored_row_writes_templated_prompt():
+    """Happy path — output row contains the templated prompt verbatim."""
+    out = build_scored_row(
+        rendered_prompt=_TEMPLATED_PROMPT,
+        gold="4",
+        n_correct=3,
+        n_rollouts=8,
+    )
+    assert out["prompt"] == _TEMPLATED_PROMPT
+    assert CHAT_TEMPLATE_OPEN_MARKER in out["prompt"]
+    assert out["answer"] == "4"
+    assert out["solve_rate"] == 3 / 8
+
+
+def test_build_scored_row_rejects_raw_prompt():
+    """Defensive guard — raw (unwrapped) prompts must raise.
+
+    This catches the 2026-05-12 bug class at the point of construction:
+    if a future code edit forgets to apply the chat template before
+    handing the prompt to build_scored_row, the curation script fails
+    loudly instead of silently writing degenerate rows.
+    """
+    raw_problem = r"Let $\mathbf{a} = \langle x, y\rangle$. Find ..."
+    assert CHAT_TEMPLATE_OPEN_MARKER not in raw_problem
+    with pytest.raises(ValueError, match="chat-template marker"):
+        build_scored_row(
+            rendered_prompt=raw_problem,
+            gold="42",
+            n_correct=2,
+            n_rollouts=8,
+        )
+
+
+def test_build_scored_row_round_trips_through_write_jsonl(tmp_path: Path):
+    """End-to-end: a row built via build_scored_row → written → re-read
+    must still carry the chat-template marker. Pins the on-disk schema
+    that scripts/train_rlvr.py P1 sanity check relies on."""
+    row = build_scored_row(
+        rendered_prompt=_TEMPLATED_PROMPT,
+        gold="4",
+        n_correct=4,
+        n_rollouts=8,
+    )
+    out = tmp_path / "rlvr_prompts.jsonl"
+    write_jsonl([row], out)
+    reread = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert CHAT_TEMPLATE_OPEN_MARKER in reread["prompt"]
+    assert reread["solve_rate"] == 0.5
 
 
 # =============================================================================

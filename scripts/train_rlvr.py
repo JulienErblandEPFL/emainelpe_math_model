@@ -217,6 +217,42 @@ def grpo_config_kwargs(
     }
 
 
+# Same marker as data/prepare_rlvr.CHAT_TEMPLATE_OPEN_MARKER. Re-declared
+# here so the runtime sanity check doesn't pull data/ into the import
+# graph (data/prepare_rlvr imports vllm-via-deferred-paths only, but
+# keeping train_rlvr self-contained reduces cross-module coupling).
+CHAT_TEMPLATE_OPEN_MARKER = "<|im_start|>"
+
+
+def assert_prompts_are_chat_templated(
+    prompts: list[dict], *, sample_size: int = 5
+) -> None:
+    """Defend against the 2026-05-12 retry2 incident.
+
+    Curated prompts MUST be chat-templated strings (output of
+    ``tokenizer.apply_chat_template(..., add_generation_prompt=True)``).
+    Raw problem text causes GRPO rollouts to never emit ``<|im_end|>``,
+    100% hit the token cap, and collapse ``reward_std`` to 0. We check
+    the first ``sample_size`` prompts and raise with a precise pointer
+    to ``data/prepare_rlvr.build_scored_row`` if any look raw.
+    """
+    if not prompts:
+        return
+    for idx, row in enumerate(prompts[:sample_size]):
+        prompt = row.get("prompt", "")
+        if CHAT_TEMPLATE_OPEN_MARKER not in prompt:
+            preview = prompt[:120].replace("\n", "\\n")
+            raise RuntimeError(
+                f"Prompt set is NOT chat-templated. Row {idx} starts "
+                f"with: {preview!r}. Expected the output of "
+                f"tokenizer.apply_chat_template(...). This causes "
+                f"100% token-cap clipping and reward_std=0 during "
+                f"GRPO (see 2026-05-12 retry2 incident). Re-run "
+                f"data/prepare_rlvr.py with the post-2026-05-12 fix "
+                f"to regenerate rlvr_prompts.jsonl."
+            )
+
+
 def load_prompt_set_jsonl(
     path: Path, *, max_prompts: int | None = None
 ) -> list[dict]:
@@ -539,6 +575,18 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     logger.info("Loaded %d prompts (capped at --max-prompts=%d)",
                 len(prompts), args.max_prompts)
+
+    # P0 (cheap, pre-GPU) — prompts must already be chat-templated. Raw
+    # prompts cause the 2026-05-12 retry2 degenerate-rollout failure:
+    # GRPO sends each prompt verbatim to the model, and an unwrapped
+    # prompt never produces <|im_end|>, so every rollout hits the token
+    # cap and reward_std collapses to 0. We block here rather than 10h
+    # later when the run finishes with no learning signal.
+    try:
+        assert_prompts_are_chat_templated(prompts)
+    except RuntimeError as e:
+        logger.error("%s", e)
+        return 4
 
     run_name = args.run_name or default_run_name()
     use_wandb = bool(os.environ.get("WANDB_API_KEY"))
