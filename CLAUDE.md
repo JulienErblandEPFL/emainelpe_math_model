@@ -206,12 +206,31 @@ v3's OMI2-driven base. The mix is composed from three sources via
 | MATH-train Level 1-3 bucket | 13k | Anchor against catastrophic forgetting on easy problems. Source has ~4.5k unique Lvl1-3 problems; ~3x oversample pre-dedup. |
 | NuminaMath-CoT (olympiad subset) | 5k | Distribution-diverse hard problems from the four-source allowlist `(olympiads, amc_aime, aops_forum, synthetic_amc)` — ~247k available problems total in the underlying dataset; we sample 5k. Complements MATH-train with competition-style breadth. The `math` source (~7.5k) is intentionally excluded to avoid cross-bucket duplicates with the EleutherAI/hendrycks_math bucket. |
 
-**Total target before dedup**: ~95k. **Effective unique-problem count
-after in-source dedup**: ~52–55k (MATH source collapses
-oversample copies). The dedup-vs-oversampling tension is documented in
-`data/prepare_sft.py` module docstring — the bucket targets control
-*per-bucket weight allocation in the sampling pool*, not literal final
-counts.
+**Total before downstream caps**: ~95k. **No cross-source dedup**
+(2026-05-13 final policy). The first cut of v4-mix ran cross-source
+dedup at the final concat and measured 94k → 50k collapse — that
+collapse eliminated the within-bucket oversampling the diagnostic
+multipliers depend on (IntAlg 12k target from 1.3k unique = collapses
+to 1.3k, defeating the lever). Disabling cross-source dedup accepts a
+small rate of true cross-source overlap as a tolerable cost; the
+downstream `per_question_cap=4` inside `build_pipeline` caps the
+multiplicity for any single query, so the effective training count
+for a small-pool bucket like Precalc lands at ~3k rows (750 unique
+problems × 4 copies each), not 7k or 750.
+
+Within-bucket oversampling now flows end-to-end:
+
+  - IntAlg bucket: 12k oversampled → after per_question_cap=4 →
+    ~5.2k rows (1.3k × 4).
+  - Precalc bucket: 7k oversampled → ~3k rows (~750 × 4).
+  - Level 4-5 bucket: 18k oversampled → bounded by 4 × the unique
+    L4-5 problem count (~3k unique → ~12k rows).
+  - Level 1-3 bucket: 13k oversampled → bounded by 4 × ~4.5k unique
+    → already-larger pool, no cap effect.
+
+The effective total trained-on per epoch is on the order of 60-70k
+rows, with the diagnostic-targeted subjects (IntAlg, Precalc, L4-5)
+contributing their full 4× weight where the source pool permits.
 
 ### Two variants from the same data
 

@@ -985,19 +985,22 @@ def test_v4_mix_oversampling_empty_pool_returns_empty():
     assert oversample_with_replacement([], target_count=10, rng=random.Random(0)) == []
 
 
-def test_v4_mix_deduplication():
-    """Cross-source dedup (2026-05-13 update): when the same problem
-    appears in OMI2 AND MATH-train, the final combined mix has it
-    EXACTLY ONCE, with the first-occurrence source winning.
+def test_v4_mix_no_cross_source_dedup():
+    """v4-mix does NOT dedup across sources (2026-05-13 final policy).
 
-    The concat order in main() is OMI2 → MATH → NuminaMath, so OMI2's
-    Llama3.1-405B teacher CoT takes precedence over MATH-train's plain
-    Hendrycks solution for any overlapping problem. This is the
-    quality-ordering choice baked into the v4-mix flow.
+    Earlier runs showed cross-source dedup collapsed 94k → 50k,
+    killing the within-bucket oversampling the diagnostic-driven
+    multipliers depend on (IntAlg 12k from 1.3k unique, Precalc 7k
+    from ~750 unique). The base-rate of true cross-source overlap is
+    small enough to accept; per_question_cap downstream limits the
+    multiplicity for any single query.
+
+    Concretely: a problem that appears in both OMI2 and MATH-train
+    must appear TWICE in the final concat — once per source. The
+    different teacher CoT versions both contribute training signal.
     """
-    # Simulate a problem that appears in BOTH OMI2 and MATH-train,
-    # with cosmetically different whitespace/LaTeX (dedup normalizes
-    # them to the same key).
+    # Same normalized problem text across OMI2 and MATH-train —
+    # would have collapsed under cross-source dedup, must survive now.
     omi2_rows = [
         {"query": "Find the value of x.", "response": "OMI2 rich CoT"},
         {"query": "Solve 2+2.", "response": "OMI2 only"},
@@ -1006,17 +1009,24 @@ def test_v4_mix_deduplication():
         {"query": "FIND THE VALUE OF X.", "response": "MATH plain solution"},
         {"query": "Compute $\\pi$.", "response": "MATH only"},
     ]
-    # The order matters: OMI2 first.
+    # Mirror main()'s v4-mix concat: OMI2 → MATH → NuminaMath (no dedup).
     combined = omi2_rows + math_rows
-    deduped = dedup_by_problem_text(combined)
-    # 4 inputs → 3 unique problems after cross-source dedup.
-    assert len(deduped) == 3
-    # OMI2 won the contested "Find the value of x" problem.
-    queries_to_responses = {r["query"]: r["response"] for r in deduped}
-    assert queries_to_responses.get("Find the value of x.") == "OMI2 rich CoT"
-    # OMI2-only and MATH-only problems both survive.
-    assert "OMI2 only" in queries_to_responses.values()
-    assert "MATH only" in queries_to_responses.values()
+    # All 4 input rows survive — no collapsing.
+    assert len(combined) == 4
+    # The contested "Find the value of x" appears once from each source.
+    responses = [r["response"] for r in combined]
+    assert "OMI2 rich CoT" in responses
+    assert "MATH plain solution" in responses
+    # The dedup helper itself still works when explicitly called —
+    # this is a deliberate choice to not call it in v4-mix, not a
+    # removal of the helper. Document that decoupling here so a future
+    # maintainer doesn't accidentally re-enable cross-source dedup.
+    deduped_if_we_did_call_it = dedup_by_problem_text(combined)
+    assert len(deduped_if_we_did_call_it) == 3, (
+        "dedup_by_problem_text still works as a helper; v4-mix just "
+        "doesn't call it. If this assertion drifts, the helper itself "
+        "is broken — fix it before re-enabling cross-source dedup."
+    )
 
 
 def test_v4_mix_within_bucket_oversampling_preserved():
@@ -1046,16 +1056,20 @@ def test_v4_mix_within_bucket_oversampling_preserved():
     assert len(set(queries)) < len(queries)
 
 
-def test_v4_mix_within_bucket_oversampling_then_cross_bucket_dedup():
-    """Full flow: bucket A oversamples problem X 5 times, bucket B
-    contains X once. After cross-bucket dedup_by_problem_text on the
-    concat, the final mix has X EXACTLY ONCE, with bucket A's first
-    occurrence winning (B's copy is dropped because it comes later in
-    concat order).
+def test_v4_mix_within_bucket_oversampling_preserved_across_concat():
+    """Bucket A oversamples problem X 5 times, bucket B contains X
+    once. Under the no-cross-source-dedup policy (2026-05-13 final),
+    the concat preserves all 6 copies of X — 5 from A's oversample
+    + 1 from B.
 
-    This pins the interaction between within-bucket oversampling
-    (preserved at compose) and the strict cross-source/cross-bucket
-    dedup (collapses everything to unique-problem-text).
+    This is the diagnostic-driven lever: small-source buckets like
+    IntAlg (1.3k unique problems, 12k target) and Precalc (~750
+    unique, 7k target) rely on within-bucket oversample copies
+    surviving into the training set. The downstream
+    per_question_cap (default 4) inside build_pipeline caps any
+    single query at 4 oversampled rows, so the effective training
+    multiplicity for X is min(6, 4) = 4 — but that's a downstream
+    decision, not a v4-mix-stage one.
     """
     # Bucket A: 5 oversampled copies of X plus one Y.
     bucket_a = [
@@ -1071,19 +1085,22 @@ def test_v4_mix_within_bucket_oversampling_then_cross_bucket_dedup():
         {"query": "X", "response": "from_B"},
         {"query": "Z", "response": "from_B_Z"},
     ]
+    # Mirror main()'s v4-mix flow: concat, no dedup.
     combined = bucket_a + bucket_b
-    deduped = dedup_by_problem_text(combined)
-    # 8 inputs (6 + 2) → 3 unique problems.
-    assert len(deduped) == 3
-    # X appears exactly once, kept from bucket A's first occurrence.
-    x_rows = [r for r in deduped if r["query"] == "X"]
-    assert len(x_rows) == 1
-    assert x_rows[0]["response"] == "from_A_1"
-    # B's copy of X is dropped.
-    assert all(r["response"] != "from_B" for r in deduped)
+    # All 8 input rows survive (no collapsing).
+    assert len(combined) == 8
+    # X appears SIX times — 5 from A's oversample + 1 from B.
+    x_rows = [r for r in combined if r["query"] == "X"]
+    assert len(x_rows) == 6
+    # Each A copy is distinguishable from the others (different responses).
+    a_x_responses = {r["response"] for r in x_rows if r["response"].startswith("from_A")}
+    assert a_x_responses == {f"from_A_{i}" for i in range(1, 6)}
+    # B's copy survives too.
+    assert any(r["response"] == "from_B" for r in x_rows)
     # Y (A-only) and Z (B-only) both survive.
-    queries = {r["query"] for r in deduped}
-    assert {"X", "Y", "Z"} == queries
+    queries = [r["query"] for r in combined]
+    assert queries.count("Y") == 1
+    assert queries.count("Z") == 1
 
 
 def test_v4_mix_auto_max_formatted_tokens(monkeypatch, tmp_path, capsys):

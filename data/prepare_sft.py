@@ -15,26 +15,41 @@ Algebra (pass@1=0.296), Precalculus (pass@1=0.339), and Level 5
 (pass@1=0.213) without losing v3's OMI2-driven base. See CLAUDE.md →
 "v4 training plan" for the full rationale.
 
-Dedup semantics (2026-05-13 update). Dedup runs ONCE on the cross-source
-concat (OMI2 + MATH + NuminaMath), not per-source. The dedup function
-itself is still strict (first-occurrence-wins by normalized problem
-text), but the change in WHERE it runs has two consequences:
+Dedup semantics (2026-05-13 — final policy). v4-mix does **not** dedup
+across sources. The first pass of the design called for cross-source
+dedup at the final concat, but operational measurement showed it
+collapsed 94k pre-dedup → 50k post-dedup, eliminating the within-bucket
+oversampling that the diagnostic-driven multipliers (IntAlg 12k from
+1.3k unique, Precalc 7k from ~750 unique) depend on. The base-rate of
+true cross-source overlap (same problem in OMI2 AND MATH-train) is
+small enough to accept as a duplicate-tolerance cost.
 
-  1. Within-bucket oversampling in compose_math_train_buckets is now
-     visible end-to-end at the COMPOSE stage — a bucket with target=10
-     from a pool of 2 unique problems composes 10 rows with duplicates,
-     and those duplicates flow into the cross-source concat unchanged.
-  2. Cross-source overlaps (the same problem in OMI2 AND MATH) are
-     collapsed at the final dedup. First-occurrence-wins, and the
-     concat order is OMI2 → MATH → NuminaMath, so the OMI2 version
-     (Llama3.1-405B teacher CoT) wins over the plain-text Hendrycks
-     solution. This is a quality-ordering choice.
+What is preserved end-to-end:
 
-The effective final-output count for a bucket is still bounded by the
-source's unique-problem count (because dedup collapses within-bucket
-duplicates too) — the diagnostic-driven weighting affects what fraction
-of the SAMPLED pool a bucket contributes, not literal final
-multiplicity. Caveat preserved from the original design.
+  - Within-bucket oversampling in compose_math_train_buckets: a bucket
+    with target=10 from a pool of 2 unique problems produces 10 rows
+    with duplicates. Those 10 rows flow into the combined list intact.
+  - The downstream per_question_cap (default 4) inside build_pipeline
+    caps any single query at 4 oversampled appearances — so the
+    final-trained multiplicity for a small-pool bucket lands in the
+    range [pool_size, 4 × pool_size], not the literal bucket target.
+    The diagnostic-driven multipliers therefore translate to "this
+    bucket's problems each appear up to 4 times per epoch", which is
+    what we want.
+
+What is NOT deduped:
+
+  - Cross-source duplicates (a problem in both OMI2 and MATH-train) —
+    they survive into training. Acceptable: rare, and the OMI2 vs.
+    MATH versions have different teacher CoT, so they contribute
+    different reasoning traces.
+  - Within-MATH cross-bucket duplicates (a Level 5 IntAlg problem
+    counted in both IntAlg and Level4-5 buckets) — also survive,
+    again capped at 4 per query by per_question_cap downstream.
+
+The ``dedup_by_problem_text`` helper still exists and is unit-tested
+(it is used by other paths and stays a public helper) — it is just
+not called from v4-mix main().
 
 OOM safety. The v4 training run on a 200k OMI2 dataset crashed at epoch
 0.08 with a 9.27 GiB single-tensor allocation on a long sequence
@@ -1186,31 +1201,33 @@ def main() -> None:
             len(numina_normalized), args.numinamath_count,
         )
 
-        # ---- Concatenate, cross-source dedup, shuffle, feed to build_pipeline ----
+        # ---- Concatenate, shuffle, feed to build_pipeline ----
         #
-        # Dedup ordering: OMI2 first → MATH second → NuminaMath third.
-        # First-occurrence-wins, so when the same problem appears in
-        # multiple sources, the OMI2 version (Llama3.1-405B teacher CoT)
-        # is preferred over the plain-text Hendrycks solution and the
-        # NuminaMath solution. This is a deliberate quality-ordering
-        # choice — the OMI2 reasoning chain is typically richer.
+        # NO cross-source dedup (2026-05-13 update). Earlier v4-mix runs
+        # collapsed 94k → 50k via cross-source dedup, killing the
+        # within-bucket oversampling the design depends on (IntAlg 12k
+        # target from 1.3k unique problems, Precalc 7k target from
+        # ~750 unique). The base-rate of true cross-source overlap
+        # (same problem in OMI2 AND MATH-train) is small enough to
+        # accept — the within-bucket oversampling effect is the
+        # diagnostic-driven lever we actually need.
+        #
+        # The downstream pipeline (build_pipeline → filter →
+        # token-cap → per-question-cap → subsample) still applies its
+        # own caps: per_question_cap (default 4) limits any single
+        # query from contributing more than 4 oversampled rows, so
+        # within-bucket oversampling lands at the [pool_size, 4 *
+        # pool_size] range rather than the raw bucket target.
         combined: list[dict] = []
         for src_rows in (omi_normalized, math_bucketed, numina_normalized):
             for r in src_rows:
                 combined.append({"query": r["query"], "response": r["response"]})
-        pre_dedup_size = len(combined)
-        combined = dedup_by_problem_text(combined)
-        logger.info(
-            "v4-mix cross-source dedup: %d → %d rows (collapsed %d duplicates "
-            "across OMI2/MATH/NuminaMath and within-MATH oversampling)",
-            pre_dedup_size, len(combined), pre_dedup_size - len(combined),
-        )
         rng.shuffle(combined)
         logger.info(
-            "v4-mix combined (pre-dedup): OMI2 %d + MATH %d + NuminaMath %d = %d, "
-            "post-dedup: %d",
+            "v4-mix combined: OMI2 %d + MATH %d + NuminaMath %d = %d rows "
+            "(no cross-source dedup; relies on per_question_cap downstream)",
             len(omi_normalized), len(math_bucketed), len(numina_normalized),
-            pre_dedup_size, len(combined),
+            len(combined),
         )
 
         # The 100k cap in the spec is enforced by passing n_samples to
