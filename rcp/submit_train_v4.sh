@@ -155,6 +155,12 @@ TRAIN_FLAGS+="${INIT_FROM_ADAPTER:+ --init-from-adapter ${INIT_FROM_ADAPTER}}"
 POD_CMD="ln -sf \"\$(command -v python3)\" /usr/local/bin/python"
 POD_CMD+=" && cd ${REPO_DIR}"
 POD_CMD+=" && pip install -r requirements.txt"
+# Liger Kernel sanity check: fail fast if the install ever breaks (the
+# primary OOM mitigation depends on this import succeeding before
+# train_sft.py launches). If this trips, requirements.txt or the wheel
+# repository drifted and the run would have died ~30 min later at the
+# train_sft.py preflight anyway — better to surface it here.
+POD_CMD+=" && python -c 'import liger_kernel; print(\"liger_kernel\", liger_kernel.__version__)'"
 if [[ -z "${SKIP_PREP:-}" ]]; then
   POD_CMD+=" && python data/prepare_sft.py ${PREP_FLAGS}"
 fi
@@ -174,6 +180,12 @@ RUNAI_ARGS=(
   --environment "HF_TOKEN=${HF_TOKEN:-}"
   --environment "WANDB_API_KEY=${WANDB_API_KEY:-}"
   --environment "WANDB_PROJECT=emainelpe-math"
+  # PyTorch CUDA caching-allocator: expandable_segments coalesces freed
+  # blocks instead of pinning them at their original size, which lowers
+  # long-run fragmentation. Belt-and-suspenders to Liger Kernel: Liger
+  # is the structural fix for the logits-tensor OOM; this knob is the
+  # fallback that helps if some other allocation grows over training.
+  --environment "PYTORCH_ALLOC_CONF=expandable_segments:True"
   --existing-pvc "claimname=course-cs-552-scratch-${GROUP},path=/scratch"
   --existing-pvc "claimname=course-cs-552-shared-ro,path=/shared-ro"
   --existing-pvc "claimname=course-cs-552-shared-rw,path=/shared-rw"

@@ -51,13 +51,17 @@ The ``dedup_by_problem_text`` helper still exists and is unit-tested
 (it is used by other paths and stays a public helper) — it is just
 not called from v4-mix main().
 
-OOM safety. The v4 training run on a 200k OMI2 dataset crashed at epoch
-0.08 with a 9.27 GiB single-tensor allocation on a long sequence
-(2026-05-12). ``--source v4-mix`` auto-defaults ``max_formatted_tokens``
-to 2900 (down from the v2/v3 default of 3500) — drops rows that would
-tokenize close to the 4096 logits cap. ``configs/lora.yaml`` is left
-untouched (locked across all four experts for the Phase 3 merge), so
-the OOM fix lives entirely at the data-prep layer.
+OOM safety. The PRIMARY OOM mitigation since 2026-05-13 is Liger Kernel's
+fused cross-entropy in ``scripts/train_sft.py`` (``use_liger_kernel=True``
+default), which removes the ``B × T × vocab × 4 bytes`` logits tensor
+from the memory equation entirely. The v4 200k OMI2 run that crashed
+at epoch 0.08 (2026-05-12) hit a 9.27 GiB single-tensor allocation —
+that allocation was the logits tensor, and it no longer exists under
+Liger. See ``CLAUDE.md`` → "OOM mitigations".
+``--source v4-mix`` still auto-defaults ``max_formatted_tokens`` to
+2900 as a belt-and-suspenders safeguard against activation-memory
+outliers on near-max-length rows. ``configs/lora.yaml`` stays untouched
+(locked across all four experts for the Phase 3 merge).
 
 Why mix: OMI2's solutions come from Llama3.1-405B-Instruct, a
 substantially stronger teacher than DART-Math's DeepSeekMath-7B-RL.
@@ -126,11 +130,17 @@ V4_DEFAULT_MATH_LEVEL13_COUNT = 13_000
 V4_DEFAULT_NUMINAMATH_COUNT = 5_000
 
 # OOM-safety cap for v4-mix. Drops formatted rows above this token count.
-# v2/v3 default is 3500; v4 tightens to 2900 because the 200k pure-OMI2 v4
-# attempt crashed at epoch 0.08 with a 9.27 GiB single-tensor allocation
-# on a long sequence. configs/lora.yaml.max_seq_length stays at 4096
-# (locked for the team merge) — the OOM fix lives at the data-prep layer
-# instead.
+# Belt-and-suspenders since 2026-05-13: the PRIMARY OOM fix is now
+# Liger Kernel's fused cross-entropy in train_sft.py (use_liger_kernel=True
+# default), which eliminates the B × T × vocab logits tensor entirely.
+# This cap stays in place as a redundant safeguard against pathological
+# rows whose activations balloon even under Liger — cheap insurance, no
+# downside on the v3-comparable working size. configs/lora.yaml.max_seq_length
+# stays at 4096 (locked for the team merge).
+# History: v2/v3 used 3500; v4 originally tightened to 2900 after the
+# 200k pure-OMI2 v4 attempt crashed at epoch 0.08 with a 9.27 GiB single-
+# tensor allocation on a long sequence. That allocation was the logits
+# tensor, which Liger now removes from the equation.
 V4_MAX_FORMATTED_TOKENS_DEFAULT = 2900
 
 # Canonical Hendrycks MATH subject names. Use the same labels as the
@@ -915,19 +925,26 @@ def main() -> None:
     # existing tests don't pass --max-formatted-tokens and don't expect
     # a token filter to fire.
     #
-    # v4-mix tightens the default to 2900 (vs 3500 for v2/v3) after the
-    # v4-200k OOM at epoch 0.08. The training-step logits + loss
-    # allocation peaked at 9.27 GiB on a single long sequence; capping
-    # rows at 2900 tokens at data-prep time prevents the worst-case
-    # allocation. configs/lora.yaml.max_seq_length stays at 4096 (locked
-    # for the team merge).
+    # Belt-and-suspenders since 2026-05-13: Liger Kernel's fused cross-
+    # entropy in train_sft.py is now the PRIMARY OOM fix (removes the
+    # B × T × vocab logits tensor from the memory equation). This cap is
+    # the secondary safeguard — drops the long tail of formatted rows
+    # whose activations balloon even under Liger. configs/lora.yaml.
+    # max_seq_length stays at 4096 (locked for the team merge).
+    #
+    # History: v4-mix tightened the default to 2900 (vs 3500 for v2/v3)
+    # after the v4-200k OOM at epoch 0.08, when the training-step logits
+    # + loss allocation peaked at 9.27 GiB on a single long sequence.
+    # That allocation is now eliminated by Liger; the cap remains
+    # in place to bound activation memory on outlier-length rows.
     max_formatted_tokens = args.max_formatted_tokens
     if max_formatted_tokens is None:
         if args.source == "v4-mix":
             max_formatted_tokens = V4_MAX_FORMATTED_TOKENS_DEFAULT
             logger.info(
-                "v4-mix: auto-set max_formatted_tokens=%d (OOM safety; "
-                "override with --max-formatted-tokens to disable).",
+                "v4-mix: auto-set max_formatted_tokens=%d (belt-and-"
+                "suspenders to Liger Kernel; override with "
+                "--max-formatted-tokens to disable).",
                 max_formatted_tokens,
             )
         elif args.source in ("openmathinstruct", "mixed"):

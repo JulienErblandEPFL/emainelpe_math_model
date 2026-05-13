@@ -229,6 +229,14 @@ def grpo_config_kwargs(
         "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
         "mask_truncated_completions": args.mask_truncated_completions,
         "log_completions": args.log_completions,
+        # Liger Kernel fused cross-entropy. Same rationale as SFT (see
+        # scripts/train_sft.sft_config_kwargs): the stock HF logits path
+        # is the dominant OOM driver on Qwen3-1.7B at long sequence
+        # lengths, and GRPO rollouts can be just as long as SFT rows.
+        # The W&B config dump from retry3 showed use_liger_kernel=False,
+        # which left the same OOM door open. Default True; CLI-disable
+        # via --no-use-liger-kernel.
+        "use_liger_kernel": args.use_liger_kernel,
         "bf16": precision == "bf16",
         "fp16": precision == "fp16",
         "gradient_checkpointing": True,
@@ -445,6 +453,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--log-completions", action="store_true",
         help="Log the first few rollouts per step to W&B. Useful for "
              "diagnosing degenerate-rollout incidents in flight; bloats logs.",
+    )
+    # Liger Kernel: same rationale as scripts/train_sft.py. The stock HF
+    # logits-cross-entropy path materializes a B × T × vocab × 4B tensor
+    # that consumes 7.5-9.3 GiB on Qwen3-1.7B at long sequences, which is
+    # the primary OOM driver. Liger Kernel fuses linear-cross-entropy and
+    # never materializes the full logits tensor. Default True; disable via
+    # --no-use-liger-kernel for A/B comparison.
+    p.add_argument(
+        "--use-liger-kernel", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Liger Kernel fused cross-entropy in GRPOConfig "
+             "(eliminates the logits-tensor OOM class). Default: True.",
     )
     p.add_argument(
         "--hard-kill-on-weak-signal", action="store_true",
@@ -838,6 +858,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     logger.info("precision=%s dtype=%s", precision, dtype)
+
+    # Liger Kernel preflight: same fail-fast as scripts/train_sft.py. The
+    # stock HF logits-cross-entropy path is the dominant OOM driver on
+    # Qwen3-1.7B at the rollout lengths GRPO uses; running without Liger
+    # silently risks repeating v4's step-1514 OOM in RL.
+    if args.use_liger_kernel:
+        try:
+            import liger_kernel  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "--use-liger-kernel=True but liger_kernel is not installed. "
+                "Install with `pip install liger-kernel>=0.8.0` (already in "
+                "requirements.txt) or pass --no-use-liger-kernel to fall "
+                "back to the stock HF cross-entropy path (and accept the "
+                "logits-tensor OOM risk on long rollouts)."
+            ) from exc
+        logger.info(
+            "Liger Kernel enabled: GRPOConfig.use_liger_kernel=True. "
+            "Fused cross-entropy avoids materializing the B × T × vocab "
+            "logits tensor — primary OOM mitigation for Qwen3-1.7B."
+        )
 
     # Tokenizer + locked chat template.
     base_model_id = lora_yaml["base_model"]

@@ -358,6 +358,108 @@ The two flags are mutually exclusive (argparse-enforced):
 
 ---
 
+## OOM mitigations (2026-05-13)
+
+The v4 SFT runs hit `torch.OutOfMemoryError` at step 1514, and the earlier
+v4-200k attempt died at epoch 0.08 — both on the same allocation. The
+fundamental cause is structural, not configurational:
+
+**The logits tensor is the dominant memory consumer.** For Qwen3-1.7B the
+vocab is 151,643. At sequence length T=4096 and per-batch B=1 the
+`(B × T × vocab × 4 bytes)` logits tensor is **2.49 GiB by itself**, and
+the contiguous `shift_logits` copy inside `compute_loss` doubles that to
+~5 GiB. With B=2 it hits ~10 GiB, with B=4 it hits ~20 GiB. On a 40 GB
+A100, after model weights (~3.4 GB in bf16), gradients (~3.4 GB), Adam
+optimizer state (~6.8 GB at fp32 moments + ~3.4 GB scratch), and
+activations (multi-GB at T=4096 with gradient_checkpointing), the
+remaining headroom is ~10-15 GB — which means even per_device_batch=1
+can OOM when activations balloon on a near-max-length sequence.
+
+### Why prior mitigations weren't enough
+
+The pre-2026-05-13 mitigations all reduce OTHER memory consumers; the
+logits tensor stays put.
+
+- `gradient_checkpointing=True`: shrinks activations by recomputing them
+  in the backward pass. Big help, but logits are not activations.
+- `max_formatted_tokens=2900`: drops the longest training rows so T<4096
+  for the worst cases. Helps the long tail, doesn't fix the headline
+  allocation — still 1.76 GiB per batch at T=2900.
+- `per_device_eval_batch_size=1` + `eval_accumulation_steps=4`: fixes
+  eval-time OOM specifically by making eval B=1 and moving predictions
+  to CPU. Training-time logits are independent of this.
+- Lower `learning_rate`, fewer `epochs`: orthogonal — no memory effect.
+
+The closer the policy gets to the trained max length, the higher the
+probability that one batch sees a near-max-length composition and trips
+the same OOM. Statistical mitigation can defer the failure but cannot
+prevent it.
+
+### Why Liger Kernel is the structural fix
+
+[Liger Kernel](https://github.com/linkedin/Liger-Kernel) provides a
+fused `LinearCrossEntropy` that NEVER materializes the full logits
+tensor. Loss and gradients are computed block-by-block directly from
+the hidden states and the embedding matrix; the per-block intermediate
+fits in a small constant memory budget regardless of vocab size. This
+removes `vocab_size × 4 bytes` from the per-batch memory equation
+entirely — `vocab_size` simply stops mattering.
+
+TRL 0.19.1's `SFTConfig` and `GRPOConfig` both accept `use_liger_kernel`.
+`liger_kernel.apply_liger_kernel_to_qwen3` exists directly (no auto
+fallback needed). Verified on the course image 2026-05-13: `liger-kernel
+0.8.0` installs cleanly alongside `trl 0.19.1`, `transformers 5.7.0`,
+the image's torch build. The saved adapter is byte-identical to a
+non-Liger run (Liger affects the loss compute path, not the LoRA
+weights), so the Phase 3 merge contract is unchanged.
+
+**Default ON** (both `scripts/train_sft.py` and `scripts/train_rlvr.py`):
+`--use-liger-kernel` is the default; pass `--no-use-liger-kernel` for
+A/B comparison. Both scripts also assert `import liger_kernel` succeeds
+at startup so a broken install fails in seconds, not 30 minutes into the
+run.
+
+### Secondary mitigation: `PYTORCH_ALLOC_CONF=expandable_segments:True`
+
+PyTorch's caching allocator pins freed blocks at their original size,
+which over a 10-14h run accumulates fragmentation: a request for 3 GiB
+can fail even when 8 GiB is free if it's spread across non-coalescing
+blocks. `expandable_segments:True` lets the allocator coalesce freed
+regions, lowering peak-resident memory under fragmentation pressure.
+The submit scripts now pass this via `--environment` so it covers both
+SFT and RLVR jobs. This is belt-and-suspenders to Liger — Liger removes
+the headline allocation; this knob helps with everything else.
+
+### Post-fix memory profile (expected)
+
+At T=4096, B=1, gradient_checkpointing on, bf16, Liger Kernel on,
+Adam-on-LoRA-only (PEFT trains ~12M parameters, not 1.7B):
+
+| Item | bf16 size |
+|---|---|
+| Base model weights | ~3.4 GB |
+| LoRA adapter (~12M params) | ~24 MB |
+| LoRA gradients | ~24 MB |
+| Adam state on LoRA (m, v in fp32) | ~96 MB |
+| Activations (T=4096, gradient_checkpointing) | ~4-6 GB |
+| **Liger fused LCE intermediate** | **~0.5 GB** (was ~5 GB without Liger) |
+| Misc + framework overhead | ~2-3 GB |
+| **Total** | **~10-13 GB / 40 GB available** |
+
+The 30 GB headroom is intentional: it survives long-tail sequences
+(when an OMI2 row tokenizes close to 4096) without hitting the wall.
+Pre-fix, the equivalent budget was ~13-18 GB used + a logits spike that
+could reach 30-35 GB on a long sequence — right against the 40 GB cap.
+
+### Throughput note
+
+Liger Kernel's fused kernels are also moderately faster — LinkedIn's
+benchmarks show ~5-10% step-time improvement for Qwen-class models on
+A100. Not a primary motivation, but the OOM fix is not paid for in
+wall-clock.
+
+---
+
 ## Locked shared files
 
 `configs/lora.yaml` and `chat_template/chat_template.jinja` are copied from

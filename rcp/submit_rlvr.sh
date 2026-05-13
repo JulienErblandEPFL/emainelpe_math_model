@@ -168,6 +168,10 @@ CURATION_FLAGS+=" --difficulty-hi ${DIFFICULTY_MAX}"
 POD_CMD="ln -sf \"\$(command -v python3)\" /usr/local/bin/python"
 POD_CMD+=" && cd ${REPO_DIR}"
 POD_CMD+=" && pip install -r requirements.txt"
+# Liger Kernel sanity check: same fail-fast as the SFT submit scripts.
+# GRPO rollouts can hit the same logits-tensor OOM as SFT batches, so
+# Liger is the primary OOM mitigation here too.
+POD_CMD+=" && python -c 'import liger_kernel; print(\"liger_kernel\", liger_kernel.__version__)'"
 if [[ -z "${SKIP_CURATION}" ]]; then
   POD_CMD+=" && python data/prepare_rlvr.py ${CURATION_FLAGS}"
 fi
@@ -187,6 +191,9 @@ RUNAI_ARGS=(
   --environment "HF_TOKEN=${HF_TOKEN:-}"
   --environment "WANDB_API_KEY=${WANDB_API_KEY:-}"
   --environment "WANDB_PROJECT=emainelpe-math"
+  # Belt-and-suspenders fragmentation mitigation; Liger Kernel is the
+  # primary OOM fix. See CLAUDE.md → "OOM mitigations" for rationale.
+  --environment "PYTORCH_ALLOC_CONF=expandable_segments:True"
   --existing-pvc "claimname=course-cs-552-scratch-${GROUP},path=/scratch"
   --existing-pvc "claimname=course-cs-552-shared-ro,path=/shared-ro"
   --existing-pvc "claimname=course-cs-552-shared-rw,path=/shared-rw"

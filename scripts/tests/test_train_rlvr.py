@@ -333,6 +333,53 @@ def test_grpo_config_kwargs_includes_new_fields():
 
 
 # =============================================================================
+# Liger Kernel — same primary OOM mitigation as SFT. Added 2026-05-13.
+# Plumbing-only tests; the kernel itself runs on the cluster.
+# =============================================================================
+
+def test_grpo_config_includes_use_liger_kernel_true_by_default():
+    """Default --use-liger-kernel=True must flow into GRPOConfig kwargs.
+    The failed retry3 run's W&B config showed use_liger_kernel=False,
+    leaving the same OOM door open for RL as v4 SFT hit at step 1514."""
+    args = _parse_args(["--output-dir", "/tmp/x"])
+    out = grpo_config_kwargs(
+        args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
+        run_name="rlvr-test", use_wandb=False,
+    )
+    assert "use_liger_kernel" in out, (
+        "use_liger_kernel must be set explicitly in GRPOConfig kwargs; "
+        "TRL's default is False, which leaves the OOM door open."
+    )
+    assert out["use_liger_kernel"] is True, (
+        f"use_liger_kernel={out['use_liger_kernel']}; must be True by "
+        "default. See CLAUDE.md → OOM mitigations."
+    )
+
+
+def test_grpo_config_use_liger_kernel_disables_when_cli_overrides():
+    """`--no-use-liger-kernel` flips GRPOConfig's field to False for
+    A/B comparison."""
+    args = _parse_args(["--output-dir", "/tmp/x", "--no-use-liger-kernel"])
+    out = grpo_config_kwargs(
+        args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
+        run_name="rlvr-test", use_wandb=False,
+    )
+    assert out["use_liger_kernel"] is False
+
+
+def test_parse_args_use_liger_kernel_default_is_true_rlvr():
+    """argparse default for --use-liger-kernel is True so the default
+    RLVR invocation gets the OOM-safe path."""
+    args = _parse_args(["--output-dir", "/tmp/x"])
+    assert args.use_liger_kernel is True
+
+
+def test_parse_args_no_use_liger_kernel_flips_to_false_rlvr():
+    args = _parse_args(["--output-dir", "/tmp/x", "--no-use-liger-kernel"])
+    assert args.use_liger_kernel is False
+
+
+# =============================================================================
 # RewardSignalCallback — pure-Python state machine. Tests drive it directly,
 # no transformers/TrainerCallback import needed.
 # =============================================================================

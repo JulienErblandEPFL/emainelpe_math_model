@@ -6,6 +6,14 @@ accelerate>=0.34.0
 datasets>=3.0.0
 bitsandbytes>=0.43.0
 vllm>=0.6.0
+# Liger Kernel: fused linear-cross-entropy. Removes the B × T × vocab logits
+# tensor from the memory equation, which is the dominant OOM driver on
+# Qwen3-1.7B (vocab=151,643) — the v4 SFT step-1514 OOM and the v4-200k
+# epoch-0.08 OOM both traced to the stock HF logits allocation. Verified
+# 2026-05-13 to install cleanly alongside the course image's TRL/transformers
+# stack; SFTConfig/GRPOConfig accept use_liger_kernel=True; Qwen3 is supported
+# directly via apply_liger_kernel_to_qwen3.
+liger-kernel>=0.8.0
 pyyaml
 huggingface_hub>=0.25.0
 wandb

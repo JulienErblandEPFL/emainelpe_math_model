@@ -135,6 +135,10 @@ TRAIN_FLAGS+="${RESUME:+ --resume ${RESUME}}"
 POD_CMD="ln -sf \"\$(command -v python3)\" /usr/local/bin/python"
 POD_CMD+=" && cd ${REPO_DIR}"
 POD_CMD+=" && pip install -r requirements.txt"
+# Liger Kernel sanity check: fail fast if the install ever breaks (the
+# primary OOM mitigation depends on this import succeeding before
+# train_sft.py launches). See submit_train_v4.sh for the rationale.
+POD_CMD+=" && python -c 'import liger_kernel; print(\"liger_kernel\", liger_kernel.__version__)'"
 # Skip prepare_sft.py when SKIP_PREP is set — used when DATA_OUT_DIR
 # already contains v2/v3 data prepared offline; running the default v1
 # prep would clobber it.
@@ -157,6 +161,10 @@ RUNAI_ARGS=(
   --environment "HF_TOKEN=${HF_TOKEN:-}"
   --environment "WANDB_API_KEY=${WANDB_API_KEY:-}"
   --environment "WANDB_PROJECT=emainelpe-math"
+  # PyTorch CUDA caching-allocator: expandable_segments coalesces freed
+  # blocks; belt-and-suspenders to Liger Kernel against fragmentation
+  # accumulation over long SFT runs.
+  --environment "PYTORCH_ALLOC_CONF=expandable_segments:True"
   --existing-pvc "claimname=course-cs-552-scratch-${GROUP},path=/scratch"
   --existing-pvc "claimname=course-cs-552-shared-ro,path=/shared-ro"
   --existing-pvc "claimname=course-cs-552-shared-rw,path=/shared-rw"

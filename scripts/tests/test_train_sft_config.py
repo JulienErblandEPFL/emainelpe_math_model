@@ -12,6 +12,7 @@ import datetime as dt
 from types import SimpleNamespace
 
 from scripts.train_sft import (
+    _parse_args,
     compute_warmup_steps,
     default_run_name,
     lora_config_kwargs,
@@ -44,6 +45,9 @@ def _default_args(**overrides):
         "per_device_train_batch_size": 4,
         "gradient_accumulation_steps": 8,
         "seed": 42,
+        # Liger Kernel on by default — added 2026-05-13 as the structural
+        # fix for the Qwen3-1.7B logits-tensor OOM class.
+        "use_liger_kernel": True,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -291,3 +295,58 @@ def test_default_run_name_reflects_epochs_and_rank():
     b = default_run_name(epochs=3, rank=16, now=when)
     assert a == "sft-20260601-0905-1ep-r32"
     assert b == "sft-20260601-0905-3ep-r16"
+
+
+# =============================================================================
+# Liger Kernel — primary OOM mitigation for Qwen3-1.7B (vocab=151,643).
+# Added 2026-05-13 after v4 SFT step-1514 OOM and v4-200k epoch-0.08 OOM.
+# These tests are plumbing-only: they verify the kwarg flows from CLI to
+# SFTConfig, not that the kernel actually runs (that's a runtime concern).
+# =============================================================================
+
+def test_sft_config_includes_use_liger_kernel_true_by_default():
+    """Default --use-liger-kernel=True must flow into SFTConfig kwargs.
+    Without this, the stock HF logits-cross-entropy path materializes the
+    B × T × vocab logits tensor and OOMs on near-max-length batches."""
+    kw = _call_sft()
+    assert "use_liger_kernel" in kw, (
+        "use_liger_kernel must be set explicitly in SFTConfig kwargs; "
+        "TRL's default is False, which leaves the OOM door open."
+    )
+    assert kw["use_liger_kernel"] is True, (
+        f"use_liger_kernel={kw['use_liger_kernel']}; must be True by "
+        "default to enable the fused cross-entropy that fixes the v4 "
+        "step-1514 OOM class. See CLAUDE.md → OOM mitigations."
+    )
+
+
+def test_sft_config_use_liger_kernel_disables_when_cli_overrides():
+    """`--no-use-liger-kernel` must flip the SFTConfig field to False.
+    Used for A/B comparison and as an escape hatch if the wheel becomes
+    incompatible on a future image."""
+    kw = _call_sft(args=_default_args(use_liger_kernel=False))
+    assert kw["use_liger_kernel"] is False
+
+
+def test_parse_args_use_liger_kernel_default_is_true():
+    """argparse default for --use-liger-kernel is True. Required-flag
+    invocation (no Liger flag) must yield True so the default training
+    path is the OOM-safe one."""
+    args = _parse_args([
+        "--train-file", "/tmp/train.jsonl",
+        "--eval-file", "/tmp/eval.jsonl",
+        "--output-dir", "/tmp/out",
+    ])
+    assert args.use_liger_kernel is True
+
+
+def test_parse_args_no_use_liger_kernel_flips_to_false():
+    """--no-use-liger-kernel (the BooleanOptionalAction negation) must
+    flip the flag. Used to A/B-test Liger's effect on loss curves."""
+    args = _parse_args([
+        "--train-file", "/tmp/train.jsonl",
+        "--eval-file", "/tmp/eval.jsonl",
+        "--output-dir", "/tmp/out",
+        "--no-use-liger-kernel",
+    ])
+    assert args.use_liger_kernel is False

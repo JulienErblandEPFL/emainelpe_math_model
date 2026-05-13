@@ -223,6 +223,16 @@ def sft_config_kwargs(
     A flat eval-loss curve does not necessarily mean the model has stopped
     improving on math; a falling eval-loss curve does not guarantee
     pass@1 went up.
+
+    Liger Kernel note: ``use_liger_kernel=True`` (default) swaps the stock
+    HuggingFace causal-LM linear-cross-entropy path for the fused Liger
+    kernel, which never materializes the full ``B × T × vocab × 4B`` logits
+    tensor. This is the structural fix for the OOM class that hit v4 at
+    step 1514 (and v4-200k at epoch 0.08) — the logits tensor alone
+    consumed 7.5-9.3 GiB on near-max-length batches, more than the model
+    weights themselves. Affects loss computation only; the locked LoRA
+    shape (r=32, alpha=64, 7 target_modules) is preserved and the saved
+    adapter is byte-identical to a non-Liger run.
     """
     warmup_steps = compute_warmup_steps(
         n_train_examples=n_train_examples,
@@ -243,6 +253,7 @@ def sft_config_kwargs(
         "assistant_only_loss": False,
         "bf16": precision == "bf16",
         "fp16": precision == "fp16",
+        "use_liger_kernel": args.use_liger_kernel,
         "gradient_checkpointing": True,
         "gradient_checkpointing_kwargs": {"use_reentrant": False},
         "logging_steps": 10,
@@ -370,6 +381,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--lora-yaml", type=Path, default=DEFAULT_LORA_YAML)
     p.add_argument("--chat-template", type=Path, default=DEFAULT_CHAT_TEMPLATE)
+    # Liger Kernel: fused linear-cross-entropy that never materializes the
+    # full B × T × vocab logits tensor. Default ON because the stock HF
+    # causal-LM path OOMs on near-max-length batches with Qwen3-1.7B
+    # (vocab=151,643) — the logits tensor alone is 7.5-9.3 GiB. Disable
+    # via --no-use-liger-kernel for A/B comparison or if the kernel is
+    # unavailable on a future image.
+    p.add_argument(
+        "--use-liger-kernel", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Liger Kernel fused cross-entropy in SFTConfig "
+             "(eliminates the logits-tensor OOM class). Default: True.",
+    )
     p.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -426,6 +449,27 @@ def main(argv: list[str] | None = None) -> None:
     )
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     logger.info("precision=%s dtype=%s", precision, dtype)
+
+    # Liger Kernel preflight: fail fast at startup if --use-liger-kernel
+    # is True but the wheel isn't importable. Stock HF logits-cross-entropy
+    # OOMs on Qwen3-1.7B near-max-length batches; running without Liger
+    # silently risks the v4 step-1514 OOM class.
+    if args.use_liger_kernel:
+        try:
+            import liger_kernel  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "--use-liger-kernel=True but liger_kernel is not installed. "
+                "Install with `pip install liger-kernel>=0.8.0` (already in "
+                "requirements.txt) or pass --no-use-liger-kernel to fall "
+                "back to the stock HF cross-entropy path (and accept the "
+                "logits-tensor OOM risk on long sequences)."
+            ) from exc
+        logger.info(
+            "Liger Kernel enabled: SFTConfig.use_liger_kernel=True. "
+            "Fused cross-entropy avoids materializing the B × T × vocab "
+            "logits tensor — primary OOM mitigation for Qwen3-1.7B."
+        )
 
     # Tokenizer + locked chat template (same idiom as verify_chat_template.py).
     base_model = lora_yaml["base_model"]
