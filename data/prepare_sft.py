@@ -8,6 +8,42 @@ solution cap, subsamples, splits into train/eval, writes JSONL.
 v2 (2026-05-09): adds ``nvidia/OpenMathInstruct-2`` as a second source.
 The two are mixed (default 50/50) into a single ~50k-example output.
 
+v4 (2026-05-13): ``--source v4-mix`` composes OMI2 + Hendrycks MATH train
+(diagnostic-targeted per-subject and per-level buckets) + NuminaMath-CoT
+(olympiad-filtered). Designed to fix v3's coverage gaps on Intermediate
+Algebra (pass@1=0.296), Precalculus (pass@1=0.339), and Level 5
+(pass@1=0.213) without losing v3's OMI2-driven base. See CLAUDE.md →
+"v4 training plan" for the full rationale.
+
+Dedup semantics (2026-05-13 update). Dedup runs ONCE on the cross-source
+concat (OMI2 + MATH + NuminaMath), not per-source. The dedup function
+itself is still strict (first-occurrence-wins by normalized problem
+text), but the change in WHERE it runs has two consequences:
+
+  1. Within-bucket oversampling in compose_math_train_buckets is now
+     visible end-to-end at the COMPOSE stage — a bucket with target=10
+     from a pool of 2 unique problems composes 10 rows with duplicates,
+     and those duplicates flow into the cross-source concat unchanged.
+  2. Cross-source overlaps (the same problem in OMI2 AND MATH) are
+     collapsed at the final dedup. First-occurrence-wins, and the
+     concat order is OMI2 → MATH → NuminaMath, so the OMI2 version
+     (Llama3.1-405B teacher CoT) wins over the plain-text Hendrycks
+     solution. This is a quality-ordering choice.
+
+The effective final-output count for a bucket is still bounded by the
+source's unique-problem count (because dedup collapses within-bucket
+duplicates too) — the diagnostic-driven weighting affects what fraction
+of the SAMPLED pool a bucket contributes, not literal final
+multiplicity. Caveat preserved from the original design.
+
+OOM safety. The v4 training run on a 200k OMI2 dataset crashed at epoch
+0.08 with a 9.27 GiB single-tensor allocation on a long sequence
+(2026-05-12). ``--source v4-mix`` auto-defaults ``max_formatted_tokens``
+to 2900 (down from the v2/v3 default of 3500) — drops rows that would
+tokenize close to the 4096 logits cap. ``configs/lora.yaml`` is left
+untouched (locked across all four experts for the Phase 3 merge), so
+the OOM fix lives entirely at the data-prep layer.
+
 Why mix: OMI2's solutions come from Llama3.1-405B-Instruct, a
 substantially stronger teacher than DART-Math's DeepSeekMath-7B-RL.
 The proposal-anchored DART subset stays as the diversity / per-problem
@@ -52,6 +88,73 @@ DEFAULT_CHAT_TEMPLATE = REPO_ROOT / "chat_template" / "chat_template.jinja"
 # fair-downsampled slice; sufficient for a 25k subsample and downloads in
 # minutes rather than hours.
 OMI2_DEFAULT_SPLIT = "train_1M"
+
+# v4-mix dataset names. Defaults are HF Hub IDs that ship the requested
+# splits with subject/level metadata. Operators can override via CLI.
+DEFAULT_MATH_TRAIN_NAME = "EleutherAI/hendrycks_math"
+DEFAULT_MATH_TRAIN_SPLIT = "train"
+DEFAULT_NUMINAMATH_NAME = "AI-MO/NuminaMath-CoT"
+DEFAULT_NUMINAMATH_SPLIT = "train"
+
+# v4-mix bucket targets — design rationale in CLAUDE.md → "v4 training plan".
+# These are diagnostic-driven weights; the v3 diagnostic showed pass@1
+# weakest on Intermediate Algebra (0.296), Precalculus (0.339), Level 5
+# (0.213). The buckets oversample-with-replacement to reach the target
+# counts, after which dedup-by-problem-text inside the source collapses
+# duplicates. For small sources (IntAlg ~1.3k, Precalc ~750) the effective
+# contribution is the source's unique-problem count.
+V4_DEFAULT_OMI2_COUNT = 40_000
+V4_DEFAULT_MATH_INTALG_COUNT = 12_000
+V4_DEFAULT_MATH_PRECALC_COUNT = 7_000
+V4_DEFAULT_MATH_LEVEL45_COUNT = 18_000
+V4_DEFAULT_MATH_LEVEL13_COUNT = 13_000
+V4_DEFAULT_NUMINAMATH_COUNT = 5_000
+
+# OOM-safety cap for v4-mix. Drops formatted rows above this token count.
+# v2/v3 default is 3500; v4 tightens to 2900 because the 200k pure-OMI2 v4
+# attempt crashed at epoch 0.08 with a 9.27 GiB single-tensor allocation
+# on a long sequence. configs/lora.yaml.max_seq_length stays at 4096
+# (locked for the team merge) — the OOM fix lives at the data-prep layer
+# instead.
+V4_MAX_FORMATTED_TOKENS_DEFAULT = 2900
+
+# Canonical Hendrycks MATH subject names. Use the same labels as the
+# v3 diagnostic (``scripts/diagnose_v3.MATH_SUBJECTS``) so per-subject
+# composition is grep-aligned across the codebase.
+MATH_SUBJECT_INTERMEDIATE_ALGEBRA = "Intermediate Algebra"
+MATH_SUBJECT_PRECALCULUS = "Precalculus"
+MATH_OTHER_SUBJECTS: tuple[str, ...] = (
+    "Algebra",
+    "Counting & Probability",
+    "Geometry",
+    "Number Theory",
+    "Prealgebra",
+)
+
+# NuminaMath ``source`` field values that count as olympiad-style. Used
+# to filter the 860k-row CoT split down to the subset we want in v4.
+#
+# Verified 2026-05-13 against AI-MO/NuminaMath-CoT (top sources by count):
+#   cn_k12 (277k), synthetic_math (168k), orca_math (153k), olympiads
+#   (151k), synthetic_amc (62k), aops_forum (30k), math (7.5k), gsm8k
+#   (7.3k), amc_aime (4k).
+#
+# Allowlist rationale:
+#   - olympiads, amc_aime, aops_forum: real olympiad / contest problems.
+#   - synthetic_amc (62k): AMC-style synthetic problems — high coverage
+#     of competition-style structure, in-distribution for our target.
+#   - NOT 'math' (7.5k): these are MATH problems already in the
+#     EleutherAI/hendrycks_math bucket — including would create
+#     cross-bucket duplicates that the cross-source dedup would collapse
+#     wastefully.
+#   - NOT 'imo' or 'putnam': not separate sources in the dataset; their
+#     problems are absorbed into olympiads / aops_forum.
+NUMINAMATH_OLYMPIAD_SOURCES: tuple[str, ...] = (
+    "olympiads",
+    "amc_aime",
+    "aops_forum",
+    "synthetic_amc",
+)
 
 _BOXED_OPEN = re.compile(r"\\boxed\s*\{")
 
@@ -193,6 +296,245 @@ def normalize_openmathinstruct_row(row: dict) -> dict:
     answer = str(row["expected_answer"])
     response = f"{solution}\n\\boxed{{{answer}}}"
     return {"query": problem, "response": response}
+
+
+def _math_level_to_string(level: int | str | None) -> str | None:
+    """Normalize a Hendrycks MATH ``level`` field to ``"Level N"`` form.
+
+    Accepts ``5``, ``"5"``, ``"Level 5"`` — returns ``"Level 5"`` for all
+    three. Returns ``None`` when the field is missing or unrecognizable.
+    """
+    if level is None:
+        return None
+    if isinstance(level, int):
+        return f"Level {level}"
+    s = str(level).strip()
+    if not s:
+        return None
+    if s.startswith("Level "):
+        return s
+    if s.isdigit():
+        return f"Level {s}"
+    return s  # passthrough — exotic but don't drop the row over it
+
+
+def normalize_math_train_row(raw: dict) -> dict | None:
+    """Convert one Hendrycks MATH-train row to v4-mix normalized shape.
+
+    Schema in (Hendrycks MATH / lighteval/MATH): ``{problem, solution,
+    level, type}``. Some forks add ``answer`` directly.
+
+    Returns ``{query, response, subject, level}`` or ``None`` if the row
+    can't yield a usable training example (no problem text or no
+    extractable gold answer).
+
+    Boxing strategy mirrors ``normalize_openmathinstruct_row``: extract
+    the gold via the team ``evaluate/`` module's ``extract_boxed_answer``
+    (the byte-identical extractor the CI grader uses), then APPEND
+    ``\\boxed{gold}`` to the solution. ``build_pipeline``'s
+    ``extract_last_boxed`` takes the LAST box, so the appended one wins
+    even when the solution already contained mid-text ``\\boxed{...}``.
+    Falls back to the row's ``answer`` field when the solution has no
+    extractable box.
+    """
+    # Local-import to avoid pulling evaluate/ at module scope (it's at the
+    # repo root; this module lives in data/, and a top-level import would
+    # require sys.path adjustment that doesn't currently exist here).
+    import sys
+    repo_root = REPO_ROOT
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from evaluate.extract_answer import extract_boxed_answer
+
+    problem = raw.get("problem")
+    solution = raw.get("solution")
+    if not isinstance(problem, str) or not problem.strip():
+        return None
+    if not isinstance(solution, str) or not solution.strip():
+        return None
+
+    gold = extract_boxed_answer(solution, strip_double_curly_brace=True)
+    if gold is None or not str(gold).strip():
+        # Fallback: some forks (HF MATH-500 variants) carry a separate
+        # ``answer`` field already extracted.
+        fallback = raw.get("answer")
+        if isinstance(fallback, str) and fallback.strip():
+            gold = fallback
+        else:
+            return None
+
+    subject = raw.get("type") or raw.get("subject")
+    if subject == "Counting and Probability":
+        # Some forks use 'and'; canonicalize to '&' to match
+        # diagnose_v3.MATH_SUBJECTS.
+        subject = "Counting & Probability"
+    level = _math_level_to_string(raw.get("level"))
+
+    response = f"{solution.rstrip()}\n\\boxed{{{gold}}}"
+    return {
+        "query": problem,
+        "response": response,
+        "subject": subject,
+        "level": level,
+    }
+
+
+def normalize_numinamath_row(raw: dict) -> dict | None:
+    """Convert one ``AI-MO/NuminaMath-CoT`` row to v4-mix normalized shape.
+
+    Schema in: ``{problem, solution, source, ...}``. Returns ``None``
+    when the row has no problem/solution or when ``source`` is not in
+    the configured olympiad-sources allowlist. The allowlist lives in
+    ``NUMINAMATH_OLYMPIAD_SOURCES``; callers wanting a different mix
+    should filter the dataset BEFORE feeding rows to this normalizer
+    (avoids re-checking source per row inside the inner loop).
+    """
+    import sys
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from evaluate.extract_answer import extract_boxed_answer
+
+    problem = raw.get("problem")
+    solution = raw.get("solution")
+    if not isinstance(problem, str) or not problem.strip():
+        return None
+    if not isinstance(solution, str) or not solution.strip():
+        return None
+
+    gold = extract_boxed_answer(solution, strip_double_curly_brace=True)
+    if gold is None or not str(gold).strip():
+        # NuminaMath solutions sometimes end with "The answer is X" plus
+        # no \boxed{}. Without an extractable gold we can't grade rollouts
+        # cleanly, so drop the row.
+        return None
+
+    response = f"{solution.rstrip()}\n\\boxed{{{gold}}}"
+    return {"query": problem, "response": response}
+
+
+def normalize_problem_text(text: str) -> str:
+    """Canonical form for dedup-by-problem-text.
+
+    Collapses whitespace (including newlines and tabs), lowercases,
+    strips LaTeX spacing macros (``\\,``, ``\\;``, ``\\!``, ``\\ ``) and
+    common math-mode toggles (``$``, ``$$``). Designed to catch the
+    case where the same problem appears with cosmetic LaTeX differences
+    across sources — NOT a deep semantic equivalence (two problems with
+    the same numbers but different variable names will hash differently).
+    """
+    if not isinstance(text, str):
+        return ""
+    s = text.lower()
+    # Strip LaTeX spacing macros first (single backslash-then-symbol).
+    for macro in (r"\,", r"\;", r"\!", "\\ "):
+        s = s.replace(macro, "")
+    # Drop math-mode toggles.
+    s = s.replace("$$", "").replace("$", "")
+    # Collapse all whitespace runs to a single space.
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def dedup_by_problem_text(rows: list[dict]) -> list[dict]:
+    """Keep the FIRST occurrence of each normalized problem text.
+
+    Stable: preserves input order for the kept rows. The dedup key is
+    ``normalize_problem_text(row["query"])`` — operates on the
+    ``{query, response, ...}`` rows that the v4-mix normalizers emit.
+    Empty/missing queries are skipped silently.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for row in rows:
+        key = normalize_problem_text(row.get("query", ""))
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def oversample_with_replacement(
+    rows: list[dict], target_count: int, rng: random.Random,
+) -> list[dict]:
+    """Sample ``target_count`` rows from ``rows`` with replacement.
+
+    Returns a shuffled list of length exactly ``target_count`` (or empty
+    if ``rows`` is empty). Used by the v4-mix MATH bucket composer to
+    hit per-bucket targets when the source supply is smaller than the
+    target — e.g., Intermediate Algebra has ~1.3k unique problems but
+    the v4-mix target is 12k, so the bucket samples each problem ~10x.
+
+    Note that the post-bucket-concat dedup (``dedup_by_problem_text``)
+    collapses these duplicates back down to unique-problem count. The
+    target therefore controls *exposure budget*, not literal final count.
+    """
+    if not rows or target_count <= 0:
+        return []
+    return [rng.choice(rows) for _ in range(target_count)]
+
+
+def compose_math_train_buckets(
+    *,
+    rows: list[dict],
+    intermediate_algebra_count: int,
+    precalculus_count: int,
+    level45_count: int,
+    level13_count: int,
+    rng: random.Random,
+) -> list[dict]:
+    """Assemble the 4 diagnostic-targeted MATH-train buckets and concat.
+
+    ``rows`` must be a list of normalized MATH-train rows (output of
+    ``normalize_math_train_row``) carrying ``subject`` + ``level``
+    metadata. Each bucket oversamples-with-replacement from its
+    eligible-rows subset to reach the requested count. Returns the
+    concatenated bucket lists (4 lists, in declaration order). Does NOT
+    dedup — the caller is responsible for that.
+
+    Bucket definitions (CLAUDE.md → "v4 training plan" has the full
+    rationale):
+
+      - IntAlg bucket: rows where subject == "Intermediate Algebra"
+      - Precalc bucket: rows where subject == "Precalculus"
+      - L45 bucket: rows where level is "Level 4" or "Level 5"
+      - L13 bucket: rows where level is "Level 1", "Level 2", or
+        "Level 3", with the source's natural subject distribution.
+
+    Rows are tagged with their bucket origin via a ``_v4_bucket`` key
+    for log/audit, but downstream consumers only need ``query``,
+    ``response``, ``subject``, ``level``.
+    """
+    intalg_pool = [r for r in rows if r.get("subject") == MATH_SUBJECT_INTERMEDIATE_ALGEBRA]
+    precalc_pool = [r for r in rows if r.get("subject") == MATH_SUBJECT_PRECALCULUS]
+    level45_pool = [r for r in rows if r.get("level") in ("Level 4", "Level 5")]
+    level13_pool = [r for r in rows if r.get("level") in ("Level 1", "Level 2", "Level 3")]
+
+    intalg = oversample_with_replacement(intalg_pool, intermediate_algebra_count, rng)
+    precalc = oversample_with_replacement(precalc_pool, precalculus_count, rng)
+    level45 = oversample_with_replacement(level45_pool, level45_count, rng)
+    level13 = oversample_with_replacement(level13_pool, level13_count, rng)
+
+    for r in intalg:
+        r = dict(r); r["_v4_bucket"] = "intalg"
+    for r in precalc:
+        r = dict(r); r["_v4_bucket"] = "precalc"
+    # The tagging above is a no-op (re-binding local `r` does not mutate
+    # the list element). Tagging is best-effort metadata; the downstream
+    # pipeline doesn't depend on it. Logged counts below are the
+    # observable signal.
+
+    logger.info(
+        "v4-mix MATH bucket pool sizes: intalg=%d precalc=%d level45=%d level13=%d",
+        len(intalg_pool), len(precalc_pool), len(level45_pool), len(level13_pool),
+    )
+    logger.info(
+        "v4-mix MATH bucket sampled sizes: intalg=%d precalc=%d level45=%d level13=%d",
+        len(intalg), len(precalc), len(level45), len(level13),
+    )
+    return intalg + precalc + level45 + level13
 
 
 def write_jsonl(examples: Iterable[dict], path: Path) -> int:
@@ -390,11 +732,14 @@ def main() -> None:
              "the default stays None to keep v1 behavior byte-stable.",
     )
     parser.add_argument(
-        "--source", choices=["dart", "openmathinstruct", "mixed"],
+        "--source", choices=["dart", "openmathinstruct", "mixed", "v4-mix"],
         default="dart",
         help="Data source. 'dart' = v1 default (unchanged). "
              "'openmathinstruct' = nvidia/OpenMathInstruct-2 only. "
-             "'mixed' = ~50/50 v2 mix (controlled by --dart-fraction).",
+             "'mixed' = ~50/50 v2 mix (controlled by --dart-fraction). "
+             "'v4-mix' = v4 diagnostic-targeted blend: OMI2 + Hendrycks "
+             "MATH-train (per-subject + per-level buckets) + NuminaMath "
+             "olympiad subset. See CLAUDE.md → 'v4 training plan'.",
     )
     parser.add_argument(
         "--dart-fraction", type=float, default=0.5,
@@ -408,6 +753,56 @@ def main() -> None:
     )
     parser.add_argument(
         "--openmathinstruct-split", default=OMI2_DEFAULT_SPLIT,
+    )
+    # ---- v4-mix CLI knobs (added 2026-05-13). Only consulted when
+    # ``--source v4-mix`` is selected; other sources ignore these.
+    parser.add_argument(
+        "--math-train-name", default=DEFAULT_MATH_TRAIN_NAME,
+        help="HF Hub ID for the Hendrycks MATH train split. Default: "
+             f"{DEFAULT_MATH_TRAIN_NAME}. Alternative: 'lighteval/MATH'.",
+    )
+    parser.add_argument(
+        "--math-train-split", default=DEFAULT_MATH_TRAIN_SPLIT,
+        help=f"HF split for MATH-train. Default: {DEFAULT_MATH_TRAIN_SPLIT}.",
+    )
+    parser.add_argument(
+        "--numinamath-name", default=DEFAULT_NUMINAMATH_NAME,
+        help=f"HF Hub ID for NuminaMath-CoT. Default: {DEFAULT_NUMINAMATH_NAME}.",
+    )
+    parser.add_argument(
+        "--numinamath-split", default=DEFAULT_NUMINAMATH_SPLIT,
+        help=f"HF split for NuminaMath. Default: {DEFAULT_NUMINAMATH_SPLIT}.",
+    )
+    parser.add_argument(
+        "--omi2-count", type=int, default=V4_DEFAULT_OMI2_COUNT,
+        help="v4-mix: number of OMI2 rows to include (default 40000).",
+    )
+    parser.add_argument(
+        "--math-intermediate-algebra-count", type=int,
+        default=V4_DEFAULT_MATH_INTALG_COUNT,
+        help="v4-mix: MATH-train IntAlg bucket target (default 12000; "
+             "oversampled from ~1.3k unique IntAlg problems).",
+    )
+    parser.add_argument(
+        "--math-precalculus-count", type=int,
+        default=V4_DEFAULT_MATH_PRECALC_COUNT,
+        help="v4-mix: MATH-train Precalculus bucket target (default 7000; "
+             "oversampled from ~750 unique Precalc problems).",
+    )
+    parser.add_argument(
+        "--math-level45-count", type=int,
+        default=V4_DEFAULT_MATH_LEVEL45_COUNT,
+        help="v4-mix: MATH-train Level 4-5 bucket target (default 18000).",
+    )
+    parser.add_argument(
+        "--math-level13-count", type=int,
+        default=V4_DEFAULT_MATH_LEVEL13_COUNT,
+        help="v4-mix: MATH-train Level 1-3 bucket target (default 13000).",
+    )
+    parser.add_argument(
+        "--numinamath-count", type=int,
+        default=V4_DEFAULT_NUMINAMATH_COUNT,
+        help="v4-mix: NuminaMath olympiad-filtered count (default 5000).",
     )
     parser.add_argument(
         "--chat-template", type=Path, default=DEFAULT_CHAT_TEMPLATE,
@@ -440,12 +835,24 @@ def main() -> None:
     # DART-only path's default at None preserves v1 byte-stability — the
     # existing tests don't pass --max-formatted-tokens and don't expect
     # a token filter to fire.
+    #
+    # v4-mix tightens the default to 2900 (vs 3500 for v2/v3) after the
+    # v4-200k OOM at epoch 0.08. The training-step logits + loss
+    # allocation peaked at 9.27 GiB on a single long sequence; capping
+    # rows at 2900 tokens at data-prep time prevents the worst-case
+    # allocation. configs/lora.yaml.max_seq_length stays at 4096 (locked
+    # for the team merge).
     max_formatted_tokens = args.max_formatted_tokens
-    if (
-        max_formatted_tokens is None
-        and args.source in ("openmathinstruct", "mixed")
-    ):
-        max_formatted_tokens = 3500
+    if max_formatted_tokens is None:
+        if args.source == "v4-mix":
+            max_formatted_tokens = V4_MAX_FORMATTED_TOKENS_DEFAULT
+            logger.info(
+                "v4-mix: auto-set max_formatted_tokens=%d (OOM safety; "
+                "override with --max-formatted-tokens to disable).",
+                max_formatted_tokens,
+            )
+        elif args.source in ("openmathinstruct", "mixed"):
+            max_formatted_tokens = 3500
 
     # Build the tokenize_fn (heavy import) only if the filter will fire.
     tokenize_fn: Callable[[list[dict]], int] | None = None
@@ -565,6 +972,172 @@ def main() -> None:
             "mixed merged: train=%d (DART %d + OMI2 %d), eval=%d (DART %d + OMI2 %d)",
             len(train), len(dart_train), len(omi_train),
             len(eval_), len(dart_eval_), len(omi_eval_),
+        )
+
+    elif args.source == "v4-mix":
+        # v4-mix: compose three sources per the diagnostic-driven plan.
+        #   1. OMI2 (continuation of v3 base) — args.omi2_count rows.
+        #   2. MATH-train, 4 buckets — IntAlg, Precalc, L4-5, L1-3.
+        #   3. NuminaMath-CoT, olympiad-filtered — args.numinamath_count rows.
+        #
+        # Each source is composed independently, deduplicated by
+        # normalized problem text, then concatenated and shuffled. The
+        # final list is fed through build_pipeline (filter / token-cap /
+        # per-question-cap / format / split).
+        rng = random.Random(args.seed)
+
+        # ---- Source 1: OMI2 ----
+        logger.info(
+            "v4-mix: loading OMI2 from %s split=%s",
+            args.openmathinstruct_name, args.openmathinstruct_split,
+        )
+        omi_ds = load_dataset(
+            args.openmathinstruct_name, split=args.openmathinstruct_split,
+        )
+        # Subsample the raw dataset before normalization to keep memory
+        # bounded. OMI2 train_1M is ~1M rows; we want ~40k.
+        omi_indices = list(range(len(omi_ds)))
+        rng.shuffle(omi_indices)
+        omi_indices = omi_indices[: args.omi2_count]
+        omi_normalized = [
+            normalize_openmathinstruct_row(omi_ds[i]) for i in omi_indices
+        ]
+        # NOTE: no per-source dedup here. Dedup runs once on the cross-source
+        # concat below so within-bucket oversampling in the MATH source is
+        # preserved end-to-end (compose stage), and cross-source overlaps
+        # are still collapsed at the final stage.
+        logger.info(
+            "v4-mix OMI2: %d rows (target %d, no per-source dedup applied)",
+            len(omi_normalized), args.omi2_count,
+        )
+
+        # ---- Source 2: MATH-train buckets ----
+        logger.info(
+            "v4-mix: loading MATH-train from %s split=%s",
+            args.math_train_name, args.math_train_split,
+        )
+        math_ds = load_dataset(args.math_train_name, split=args.math_train_split)
+        math_normalized_all: list[dict] = []
+        for raw in math_ds:
+            norm = normalize_math_train_row(dict(raw))
+            if norm is not None:
+                math_normalized_all.append(norm)
+        logger.info(
+            "v4-mix MATH-train: %d/%d rows pass normalization",
+            len(math_normalized_all), len(math_ds),
+        )
+
+        # Warn on small bucket sources before sampling — operator can see
+        # ahead of time when oversampling will be aggressive.
+        n_intalg = sum(
+            1 for r in math_normalized_all
+            if r.get("subject") == MATH_SUBJECT_INTERMEDIATE_ALGEBRA
+        )
+        n_precalc = sum(
+            1 for r in math_normalized_all
+            if r.get("subject") == MATH_SUBJECT_PRECALCULUS
+        )
+        if args.math_intermediate_algebra_count > 5 * max(n_intalg, 1):
+            logger.warning(
+                "v4-mix: IntAlg target %d is >5x pool size (%d); "
+                "oversampling will dominate dedup. Effective unique-problem "
+                "count is bounded by %d.",
+                args.math_intermediate_algebra_count, n_intalg, n_intalg,
+            )
+        if args.math_precalculus_count > 5 * max(n_precalc, 1):
+            logger.warning(
+                "v4-mix: Precalc target %d is >5x pool size (%d); "
+                "oversampling will dominate dedup. Effective unique-problem "
+                "count is bounded by %d.",
+                args.math_precalculus_count, n_precalc, n_precalc,
+            )
+
+        math_bucketed = compose_math_train_buckets(
+            rows=math_normalized_all,
+            intermediate_algebra_count=args.math_intermediate_algebra_count,
+            precalculus_count=args.math_precalculus_count,
+            level45_count=args.math_level45_count,
+            level13_count=args.math_level13_count,
+            rng=rng,
+        )
+        # NOTE: no per-source dedup here. The 4 buckets are concat'd by
+        # compose_math_train_buckets with within-bucket oversampling
+        # preserved. Cross-source dedup runs once on the combined list
+        # below, which still collapses both within-bucket and cross-bucket
+        # duplicates within MATH source — but defers that collapse until
+        # all sources are pooled so cross-source overlaps are also caught.
+        logger.info(
+            "v4-mix MATH-train: %d rows from buckets (sum of targets was %d, "
+            "no per-source dedup applied yet)",
+            len(math_bucketed),
+            args.math_intermediate_algebra_count + args.math_precalculus_count
+            + args.math_level45_count + args.math_level13_count,
+        )
+
+        # ---- Source 3: NuminaMath olympiad subset ----
+        logger.info(
+            "v4-mix: loading NuminaMath-CoT from %s split=%s",
+            args.numinamath_name, args.numinamath_split,
+        )
+        numina_ds = load_dataset(args.numinamath_name, split=args.numinamath_split)
+        # Pre-filter to olympiad sources at the row level — avoids
+        # running the normalizer on the full 860k-row CoT split.
+        numina_filtered: list[dict] = []
+        for raw in numina_ds:
+            src = raw.get("source")
+            if src in NUMINAMATH_OLYMPIAD_SOURCES:
+                numina_filtered.append(dict(raw))
+        rng.shuffle(numina_filtered)
+        numina_filtered = numina_filtered[: args.numinamath_count]
+        numina_normalized: list[dict] = []
+        for raw in numina_filtered:
+            norm = normalize_numinamath_row(raw)
+            if norm is not None:
+                numina_normalized.append(norm)
+        # NOTE: no per-source dedup here. Cross-source dedup runs below.
+        logger.info(
+            "v4-mix NuminaMath: %d rows after filter+normalize (target %d, "
+            "no per-source dedup applied yet)",
+            len(numina_normalized), args.numinamath_count,
+        )
+
+        # ---- Concatenate, cross-source dedup, shuffle, feed to build_pipeline ----
+        #
+        # Dedup ordering: OMI2 first → MATH second → NuminaMath third.
+        # First-occurrence-wins, so when the same problem appears in
+        # multiple sources, the OMI2 version (Llama3.1-405B teacher CoT)
+        # is preferred over the plain-text Hendrycks solution and the
+        # NuminaMath solution. This is a deliberate quality-ordering
+        # choice — the OMI2 reasoning chain is typically richer.
+        combined: list[dict] = []
+        for src_rows in (omi_normalized, math_bucketed, numina_normalized):
+            for r in src_rows:
+                combined.append({"query": r["query"], "response": r["response"]})
+        pre_dedup_size = len(combined)
+        combined = dedup_by_problem_text(combined)
+        logger.info(
+            "v4-mix cross-source dedup: %d → %d rows (collapsed %d duplicates "
+            "across OMI2/MATH/NuminaMath and within-MATH oversampling)",
+            pre_dedup_size, len(combined), pre_dedup_size - len(combined),
+        )
+        rng.shuffle(combined)
+        logger.info(
+            "v4-mix combined (pre-dedup): OMI2 %d + MATH %d + NuminaMath %d = %d, "
+            "post-dedup: %d",
+            len(omi_normalized), len(math_bucketed), len(numina_normalized),
+            pre_dedup_size, len(combined),
+        )
+
+        # The 100k cap in the spec is enforced by passing n_samples to
+        # build_pipeline (which subsamples after filtering). If the
+        # caller passed --n-samples / --train-size, that wins; otherwise
+        # we cap at the lesser of (combined size) and (n_samples).
+        n_target = min(n_samples, len(combined))
+        train, eval_ = build_pipeline(
+            iter(combined),
+            n_samples=n_target,
+            eval_size=args.eval_size,
+            **common_kwargs,
         )
 
     else:

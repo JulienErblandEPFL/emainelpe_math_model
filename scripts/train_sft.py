@@ -7,10 +7,32 @@ in ``configs/lora.yaml``. The shared chat template at
 after ``save_pretrained`` so the merge in Phase 3 cannot silently drift.
 
 Pure helpers (``load_lora_yaml``, ``load_chat_template``, ``lora_config_kwargs``,
-``sft_config_kwargs``, ``choose_precision``, ``default_run_name``) are CPU-
-testable and live at module scope. The heavy ML imports (``torch``, ``peft``,
-``trl``, ``transformers``, ``datasets``) are deferred into ``main()`` so the
-unit tests can run on a laptop without those wheels installed.
+``sft_config_kwargs``, ``choose_precision``, ``default_run_name``,
+``validate_init_adapter_config``) are CPU-testable and live at module
+scope. The heavy ML imports (``torch``, ``peft``, ``trl``, ``transformers``,
+``datasets``) are deferred into ``main()`` so the unit tests can run on a
+laptop without those wheels installed.
+
+Two ways to start training from a prior checkpoint:
+
+  - ``--resume``: continue a previously interrupted training run.
+    Reloads the HF Trainer state (optimizer momenta, LR scheduler
+    position, RNG state, dataset position). The training data must
+    match the original run; this is just a "pick up where we left off"
+    operation.
+
+  - ``--init-from-adapter PATH``: start a FRESH training run on
+    ``--train-file`` (typically a new dataset), but initialize the
+    LoRA weights from the adapter at PATH instead of from a random
+    LoRA init. Fresh optimizer + LR scheduler + RNG. Used for v4
+    training where we want to build on v3's learned weights without
+    inheriting v3's optimizer state (which was tuned for the v3 OMI2
+    dataset, not the v4-mix). Validates the adapter's r / alpha /
+    target_modules against the team-locked ``configs/lora.yaml``
+    before training starts — refuses to launch on a mismatched
+    adapter to keep the Phase 3 merge safe.
+
+The two flags are mutually exclusive (enforced by argparse).
 
 Smoke run on RCP (Stage 3 "Done when" criterion):
 
@@ -95,6 +117,56 @@ def lora_config_kwargs(yaml_dict: dict) -> dict:
         "task_type": lora["task_type"],
         "target_modules": list(lora["target_modules"]),
     }
+
+
+def validate_init_adapter_config(
+    adapter_cfg: dict, lora_yaml: dict,
+) -> None:
+    """Assert a loaded adapter's LoRA shape matches the team-locked spec.
+
+    Used by ``--init-from-adapter``: when training v4 from v3's adapter,
+    we MUST verify v3's adapter was trained with the team-locked r,
+    alpha, and target_modules. Mismatch here would silently produce a v4
+    adapter whose shape diverges from the locked spec, breaking the
+    Phase 3 merge.
+
+    ``adapter_cfg`` is the parsed ``adapter_config.json`` dict (PEFT's
+    canonical on-disk format for LoRA adapters). ``lora_yaml`` is the
+    parsed ``configs/lora.yaml``. Raises ``RuntimeError`` with a precise
+    field-by-field diff when any of {r, alpha, target_modules}
+    mismatches; returns ``None`` on a clean match.
+    """
+    expected = lora_yaml["lora"]
+    actual_r = adapter_cfg.get("r")
+    actual_alpha = adapter_cfg.get("lora_alpha")
+    actual_modules = adapter_cfg.get("target_modules") or []
+
+    if actual_r != expected["r"]:
+        raise RuntimeError(
+            f"--init-from-adapter: adapter r={actual_r} does not match "
+            f"locked configs/lora.yaml r={expected['r']}. The Phase 3 "
+            f"merge requires identical rank across all four experts; "
+            f"refusing to launch on a mismatched adapter."
+        )
+    if actual_alpha != expected["alpha"]:
+        raise RuntimeError(
+            f"--init-from-adapter: adapter lora_alpha={actual_alpha} does "
+            f"not match locked configs/lora.yaml alpha={expected['alpha']}. "
+            f"The Phase 3 merge requires identical alpha across all four "
+            f"experts; refusing to launch on a mismatched adapter."
+        )
+    expected_modules = set(expected["target_modules"])
+    if set(actual_modules) != expected_modules:
+        missing = sorted(expected_modules - set(actual_modules))
+        extra = sorted(set(actual_modules) - expected_modules)
+        raise RuntimeError(
+            f"--init-from-adapter: adapter target_modules "
+            f"{sorted(actual_modules)} does not match locked "
+            f"configs/lora.yaml target_modules "
+            f"{sorted(expected_modules)}. Missing in adapter: {missing}. "
+            f"Extra in adapter: {extra}. The Phase 3 merge requires the "
+            f"exact 7-module set across all four experts."
+        )
 
 
 def choose_precision(
@@ -268,10 +340,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--per-device-train-batch-size", type=int, default=4)
     p.add_argument("--gradient-accumulation-steps", type=int, default=8)
     p.add_argument("--run-name", default=None)
-    p.add_argument(
+    resume_or_init = p.add_mutually_exclusive_group()
+    resume_or_init.add_argument(
         "--resume", default=None,
         help="'latest' to resume from the most recent checkpoint under "
-             "--output-dir, or a path to a specific checkpoint dir.",
+             "--output-dir, or a path to a specific checkpoint dir. "
+             "Reloads optimizer + LR scheduler + RNG state from the "
+             "checkpoint. Mutually exclusive with --init-from-adapter.",
+    )
+    resume_or_init.add_argument(
+        "--init-from-adapter", type=Path, default=None,
+        dest="init_from_adapter",
+        help="Path to a trained LoRA adapter directory (Stage 3 final/). "
+             "Loads the base model + this adapter via "
+             "PeftModel.from_pretrained, then trains on --train-file with "
+             "a FRESH optimizer + LR scheduler. Use this to start v4 from "
+             "v3's learned weights without inheriting v3's optimizer state "
+             "(which was tuned for v3's data, not the new v4-mix). The "
+             "adapter's LoRA shape is validated against configs/lora.yaml "
+             "before training launches. Mutually exclusive with --resume.",
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
@@ -360,6 +447,35 @@ def main(argv: list[str] | None = None) -> None:
         dtype=dtype,
         device_map="auto",
     )
+
+    # --init-from-adapter: attach a pre-trained LoRA adapter to the base
+    # model before SFTTrainer runs. The trainer will then continue training
+    # the EXISTING adapter weights with a fresh optimizer + LR scheduler.
+    # We validate the adapter's shape against the locked yaml first so a
+    # silently-mismatched r/alpha/target_modules cannot start a run that
+    # would break the Phase 3 merge.
+    init_adapter_in_use = bool(args.init_from_adapter)
+    if init_adapter_in_use:
+        import json
+        from peft import PeftModel
+
+        adapter_dir = args.init_from_adapter
+        adapter_cfg_path = adapter_dir / "adapter_config.json"
+        if not adapter_cfg_path.is_file():
+            raise RuntimeError(
+                f"--init-from-adapter: no adapter_config.json at {adapter_cfg_path}. "
+                f"The PATH must point at a PEFT adapter directory (e.g., "
+                f"Stage 3's final/)."
+            )
+        with open(adapter_cfg_path, encoding="utf-8") as f:
+            adapter_cfg = json.load(f)
+        validate_init_adapter_config(adapter_cfg, lora_yaml)
+        logger.info(
+            "--init-from-adapter: loading adapter from %s (validated against "
+            "locked LoRA spec)", adapter_dir,
+        )
+        model = PeftModel.from_pretrained(model, str(adapter_dir), is_trainable=True)
+
     model.gradient_checkpointing_enable()
     # use_cache must be off when gradient_checkpointing is on.
     model.config.use_cache = False
@@ -393,7 +509,9 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("run_name=%s", run_name)
 
     # Build configs from the same dicts the unit tests lock against.
-    lora_config = LoraConfig(**lora_config_kwargs(lora_yaml))
+    # When --init-from-adapter is set, the model already carries a PEFT
+    # adapter; passing peft_config to SFTTrainer would add a SECOND
+    # adapter on top of the first one, which is not what we want.
     sft_config = SFTConfig(**sft_config_kwargs(
         args=args,
         yaml_dict=lora_yaml,
@@ -402,6 +520,10 @@ def main(argv: list[str] | None = None) -> None:
         use_wandb=use_wandb,
         n_train_examples=len(train_ds),
     ))
+    if init_adapter_in_use:
+        trainer_peft_config = None
+    else:
+        trainer_peft_config = LoraConfig(**lora_config_kwargs(lora_yaml))
 
     trainer = SFTTrainer(
         model=model,
@@ -409,7 +531,7 @@ def main(argv: list[str] | None = None) -> None:
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         processing_class=tokenizer,
-        peft_config=lora_config,
+        peft_config=trainer_peft_config,
     )
 
     # Train.

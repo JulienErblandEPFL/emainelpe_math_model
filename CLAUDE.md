@@ -179,6 +179,166 @@ the difficulty band's empirical guarantee depends on it.
 
 ---
 
+## v4 training plan (2026-05-13)
+
+The v3 diagnostic on MATH-500 (scripts/diagnose_v3.py) surfaced three
+specific coverage gaps:
+
+| Slice | v3 pass@1 | gap vs strongest slice |
+|---|---|---|
+| Intermediate Algebra | 0.296 | -0.14 vs Algebra |
+| Precalculus | 0.339 | -0.10 vs Algebra |
+| Level 5 (any subject) | 0.213 | -0.25 vs Level 1 |
+| Level 4 | flat-ish | (informational) |
+
+v4 is a **targeted SFT run** designed to fix these gaps without losing
+v3's OMI2-driven base. The mix is composed from three sources via
+`data/prepare_sft.py --source v4-mix`:
+
+### v4-mix composition
+
+| Source | Target | Rationale |
+|---|---|---|
+| OMI2 (train_1M subset) | 40k | Carries v3's strongest signal forward — Llama3.1-405B teacher; the source v3 won on. Continuation, not replacement. |
+| MATH-train IntAlg bucket | 12k | Direct fix for v3's IntAlg gap. Source has ~1.3k unique IntAlg problems; the 12k target oversamples ~10x BEFORE dedup. After in-source dedup, contributes ~1.3k unique problems. |
+| MATH-train Precalc bucket | 7k | Direct fix for v3's Precalc gap. Source has ~750 unique Precalc problems; ~10x oversample pre-dedup; ~750 unique post-dedup. |
+| MATH-train Level 4-5 bucket | 18k | Direct fix for v3's Level 5 gap. Source has ~3k unique Lvl4-5 problems across all subjects; ~6x oversample pre-dedup. |
+| MATH-train Level 1-3 bucket | 13k | Anchor against catastrophic forgetting on easy problems. Source has ~4.5k unique Lvl1-3 problems; ~3x oversample pre-dedup. |
+| NuminaMath-CoT (olympiad subset) | 5k | Distribution-diverse hard problems from the four-source allowlist `(olympiads, amc_aime, aops_forum, synthetic_amc)` — ~247k available problems total in the underlying dataset; we sample 5k. Complements MATH-train with competition-style breadth. The `math` source (~7.5k) is intentionally excluded to avoid cross-bucket duplicates with the EleutherAI/hendrycks_math bucket. |
+
+**Total target before dedup**: ~95k. **Effective unique-problem count
+after in-source dedup**: ~52–55k (MATH source collapses
+oversample copies). The dedup-vs-oversampling tension is documented in
+`data/prepare_sft.py` module docstring — the bucket targets control
+*per-bucket weight allocation in the sampling pool*, not literal final
+counts.
+
+### Two variants from the same data
+
+Both variants train on the same v4-mix dataset. They differ in
+**initialization** and **learning rate**:
+
+| Variant | Init from | LR | When it's the right call |
+|---|---|---|---|
+| **v4-fresh** | base Qwen3-1.7B | 1e-4 | Clean slate. The v3 SFT optimization may have driven the policy into a local optimum that v4-mix can't escape; fresh init explores a fresh basin. |
+| **v4-resume** | v3's adapter (via `--init-from-adapter`) | 5e-5 | Build on v3's wins. Use when you expect v3's OMI2-derived capabilities to be a net positive that the new MATH/NuminaMath data refines, not contradicts. Gentler LR avoids erasing v3's learned weights. |
+
+**Pick the better of the two for the math expert.** Train both,
+evaluate via `scripts/eval_local.py` + `scripts/diagnose_v3.py`,
+publish whichever wins on `validation_samples/math.jsonl` pass@8 with
+non-regressing per-subject diagnostic numbers.
+
+### OOM fix: data-prep cap, not yaml change
+
+The v4-200k OMI2 attempt (2026-05-12) crashed at epoch 0.08 with a
+9.27 GiB single-tensor allocation on a long training sequence. The
+natural fix would be to lower `lora.yaml.max_seq_length` from 4096
+to 2900 — but **`configs/lora.yaml` is locked across all four team
+experts** for the Phase 3 DARE + AdaMerging merge. Any divergence
+there would silently break the merge.
+
+The chosen fix lives entirely at the data-prep layer:
+`--source v4-mix` auto-defaults `--max-formatted-tokens` to 2900,
+which drops rows from `train.jsonl` whose Qwen3-tokenized formatted
+chat exceeds the cap. The locked yaml is untouched; the training step
+never sees a long sequence; the merge contract is preserved.
+
+Override knob (use sparingly): pass `V4_MAX_FORMATTED_TOKENS=3500` to
+`submit_train_v4.sh` to restore the v2/v3 default and accept the OOM
+risk on long-sequence outliers.
+
+### Pre-launch verification (both datasets verified accessible 2026-05-13)
+
+Before launching, confirm the two non-OMI2 HF datasets are still
+reachable and emit the expected schema. Both were verified on
+2026-05-13 and the commands below should reproduce the same output
+on the cluster pod (where the script will actually run).
+
+**a. Verify MATH train (`EleutherAI/hendrycks_math`).** The dataset
+ships per-subject configs; we load the `algebra` config to confirm
+schema and count without pulling all 7 subjects.
+
+```bash
+python3 -c "from datasets import load_dataset; d = load_dataset('EleutherAI/hendrycks_math', 'algebra', split='train'); print(len(d), list(d[0].keys()))"
+```
+
+Expected output:
+
+```
+1744 ['problem', 'level', 'type', 'solution']
+```
+
+If `len(d)` differs or the schema is missing any of those four keys,
+do NOT launch — the v4-mix MATH bucket composer expects exactly that
+schema. The total train rows across all 7 subjects is ~7.5k; the
+algebra config alone is the largest single subject.
+
+**b. Verify NuminaMath (`AI-MO/NuminaMath-CoT`).** Confirms the
+`source` field values match the four-entry olympiad allowlist
+(`olympiads`, `amc_aime`, `aops_forum`, `synthetic_amc`).
+
+```bash
+python3 -c "from datasets import load_dataset; import collections; d = load_dataset('AI-MO/NuminaMath-CoT', split='train'); print('Schema:', list(d[0].keys())); print('Sources:', collections.Counter(r['source'] for r in d).most_common(10))"
+```
+
+Expected schema: `['source', 'problem', 'solution', 'messages']`
+
+Expected top sources (counts approximate):
+
+```
+cn_k12       (~277k)
+synthetic_math (~168k)
+orca_math    (~153k)
+olympiads    (~151k)   ← in allowlist
+synthetic_amc (~62k)   ← in allowlist
+aops_forum   (~30k)    ← in allowlist
+math         (~7.5k)
+gsm8k        (~7.3k)
+amc_aime     (~4k)     ← in allowlist
+...
+```
+
+The four-entry allowlist totals ~247k available problems
+(olympiads 151k + synthetic_amc 62k + aops_forum 30k + amc_aime 4k).
+We sample 5k of them. If the `source` field stops matching this
+spelling (HF datasets occasionally rename), update
+`NUMINAMATH_OLYMPIAD_SOURCES` in `data/prepare_sft.py` and rerun the
+test suite before launching.
+
+### Launch commands (paste-ready)
+
+```bash
+# v4-fresh — start from base Qwen3-1.7B, LR=1e-4
+GASPAR=erbland GROUP=g65 \
+  HF_TOKEN=$HF_TOKEN WANDB_API_KEY=$WANDB_API_KEY \
+  ./rcp/submit_train_v4.sh fresh
+
+# v4-resume — start from v3's adapter, LR=5e-5
+GASPAR=erbland GROUP=g65 \
+  HF_TOKEN=$HF_TOKEN WANDB_API_KEY=$WANDB_API_KEY \
+  ./rcp/submit_train_v4.sh resume
+```
+
+Each launches a `runai submit` job with the v4-mix data prep + LoRA
+training pipeline. Estimated wall-clock: ~10-14h on 1×A100 40g per
+variant. Run them in parallel if cluster quota permits.
+
+### `--init-from-adapter` mechanism (v4-resume specifics)
+
+`scripts/train_sft.py --init-from-adapter PATH` does NOT reload
+optimizer + LR scheduler state (unlike `--resume`). It only loads the
+adapter's LoRA weights via `PeftModel.from_pretrained(base, PATH)`,
+then trains fresh on the new data with a fresh optimizer / scheduler.
+The adapter's `r` / `lora_alpha` / `target_modules` are validated
+against `configs/lora.yaml` before training launches — a mismatched
+adapter is refused with a clear error to keep the Phase 3 merge safe.
+
+The two flags are mutually exclusive (argparse-enforced):
+- `--resume`: continue interrupted training on the SAME data
+- `--init-from-adapter`: continue training on NEW data, fresh optimizer
+
+---
+
 ## Locked shared files
 
 `configs/lora.yaml` and `chat_template/chat_template.jinja` are copied from

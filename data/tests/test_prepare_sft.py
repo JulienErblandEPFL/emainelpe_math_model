@@ -11,12 +11,19 @@ import random
 import pytest
 
 from prepare_sft import (
+    V4_MAX_FORMATTED_TOKENS_DEFAULT,
     apply_per_question_cap,
     build_pipeline,
+    compose_math_train_buckets,
+    dedup_by_problem_text,
     extract_last_boxed,
     format_response,
     make_example,
+    normalize_math_train_row,
+    normalize_numinamath_row,
     normalize_openmathinstruct_row,
+    normalize_problem_text,
+    oversample_with_replacement,
     resolve_n_samples,
     strip_trailing_preamble,
     write_jsonl,
@@ -899,3 +906,271 @@ class TestOpenMathInstructEndToEnd:
             "token filter failed to drop the marked-long row: "
             f"{len(long_prompts)} survived"
         )
+
+
+# =============================================================================
+# v4-mix tests (added 2026-05-13). Cover the pure helpers and CLI-level
+# auto-default for --max-formatted-tokens. Heavy paths (the
+# build_pipeline + load_dataset + normalize chain in main()) are exercised
+# by the existing OMI2 / mixed tests above; here we focus on what's NEW.
+# =============================================================================
+
+def _v4_math_row(problem: str, gold: str, subject: str, level: int | str) -> dict:
+    """Mock one Hendrycks MATH-train row (the shape normalize_math_train_row
+    consumes). The solution carries an explicit \\boxed{gold} so the
+    normalizer's extract path is exercised."""
+    return {
+        "problem": problem,
+        "solution": (
+            f"This is the working for {problem}. Step by step. "
+            r"Therefore the answer is \boxed{" + gold + r"}."
+        ),
+        "type": subject,
+        "level": level,
+    }
+
+
+def test_v4_mix_composition_respects_counts():
+    """compose_math_train_buckets samples each bucket to its requested
+    count. With a small synthetic dataset the four bucket totals must
+    equal the sum of requested counts BEFORE dedup runs."""
+    rows = []
+    # 3 IntAlg problems, 2 Precalc, 2 Algebra L5, 2 Algebra L2.
+    for i in range(3):
+        rows.append({"query": f"IA_{i}", "response": "r", "subject": "Intermediate Algebra", "level": "Level 3"})
+    for i in range(2):
+        rows.append({"query": f"PC_{i}", "response": "r", "subject": "Precalculus", "level": "Level 4"})
+    for i in range(2):
+        rows.append({"query": f"AL_L5_{i}", "response": "r", "subject": "Algebra", "level": "Level 5"})
+    for i in range(2):
+        rows.append({"query": f"AL_L2_{i}", "response": "r", "subject": "Algebra", "level": "Level 2"})
+
+    rng = random.Random(42)
+    out = compose_math_train_buckets(
+        rows=rows,
+        intermediate_algebra_count=10,
+        precalculus_count=8,
+        level45_count=6,
+        level13_count=5,
+        rng=rng,
+    )
+    # Sum of bucket targets — pre-dedup, this is exact.
+    assert len(out) == 10 + 8 + 6 + 5
+
+
+def test_v4_mix_oversampling_handles_small_source():
+    """When the source pool is smaller than the bucket target,
+    oversample_with_replacement samples with replacement (some problems
+    appear multiple times) and does NOT raise. This is the IntAlg/Precalc
+    case in real data (~1.3k / 750 unique problems vs targets of 12k / 7k)."""
+    small_pool = [
+        {"query": f"only_{i}", "response": "r"}
+        for i in range(3)
+    ]
+    rng = random.Random(0)
+    out = oversample_with_replacement(small_pool, target_count=30, rng=rng)
+    assert len(out) == 30
+    # With 3 unique problems sampled 30 times, every output row's query is
+    # one of the originals.
+    assert all(r["query"].startswith("only_") for r in out)
+    # At least one duplicate exists (otherwise oversample didn't replicate).
+    queries = [r["query"] for r in out]
+    assert len(set(queries)) < len(queries)
+
+
+def test_v4_mix_oversampling_empty_pool_returns_empty():
+    """Robustness: oversample on an empty pool must not crash."""
+    assert oversample_with_replacement([], target_count=10, rng=random.Random(0)) == []
+
+
+def test_v4_mix_deduplication():
+    """Cross-source dedup (2026-05-13 update): when the same problem
+    appears in OMI2 AND MATH-train, the final combined mix has it
+    EXACTLY ONCE, with the first-occurrence source winning.
+
+    The concat order in main() is OMI2 → MATH → NuminaMath, so OMI2's
+    Llama3.1-405B teacher CoT takes precedence over MATH-train's plain
+    Hendrycks solution for any overlapping problem. This is the
+    quality-ordering choice baked into the v4-mix flow.
+    """
+    # Simulate a problem that appears in BOTH OMI2 and MATH-train,
+    # with cosmetically different whitespace/LaTeX (dedup normalizes
+    # them to the same key).
+    omi2_rows = [
+        {"query": "Find the value of x.", "response": "OMI2 rich CoT"},
+        {"query": "Solve 2+2.", "response": "OMI2 only"},
+    ]
+    math_rows = [
+        {"query": "FIND THE VALUE OF X.", "response": "MATH plain solution"},
+        {"query": "Compute $\\pi$.", "response": "MATH only"},
+    ]
+    # The order matters: OMI2 first.
+    combined = omi2_rows + math_rows
+    deduped = dedup_by_problem_text(combined)
+    # 4 inputs → 3 unique problems after cross-source dedup.
+    assert len(deduped) == 3
+    # OMI2 won the contested "Find the value of x" problem.
+    queries_to_responses = {r["query"]: r["response"] for r in deduped}
+    assert queries_to_responses.get("Find the value of x.") == "OMI2 rich CoT"
+    # OMI2-only and MATH-only problems both survive.
+    assert "OMI2 only" in queries_to_responses.values()
+    assert "MATH only" in queries_to_responses.values()
+
+
+def test_v4_mix_within_bucket_oversampling_preserved():
+    """A single bucket with target=10 from a pool of 2 unique problems
+    produces 10 rows (with duplicates). This tests the BUCKET COMPOSITION
+    stage — within-bucket oversampling is preserved at compose output,
+    BEFORE any dedup runs.
+
+    The downstream dedup at cross-source concat will collapse these
+    duplicates, but inside the bucket the oversample distribution
+    survives. This is the input the diagnostic-driven multipliers
+    operate on.
+    """
+    pool = [
+        {"query": "P_0", "response": "r0"},
+        {"query": "P_1", "response": "r1"},
+    ]
+    rng = random.Random(42)
+    out = oversample_with_replacement(pool, target_count=10, rng=rng)
+    # Exactly 10 rows — oversampling hit the target count.
+    assert len(out) == 10
+    # Both source problems contribute at least once.
+    queries = [r["query"] for r in out]
+    assert "P_0" in queries
+    assert "P_1" in queries
+    # Duplicates exist (oversample with replacement from a 2-pool).
+    assert len(set(queries)) < len(queries)
+
+
+def test_v4_mix_within_bucket_oversampling_then_cross_bucket_dedup():
+    """Full flow: bucket A oversamples problem X 5 times, bucket B
+    contains X once. After cross-bucket dedup_by_problem_text on the
+    concat, the final mix has X EXACTLY ONCE, with bucket A's first
+    occurrence winning (B's copy is dropped because it comes later in
+    concat order).
+
+    This pins the interaction between within-bucket oversampling
+    (preserved at compose) and the strict cross-source/cross-bucket
+    dedup (collapses everything to unique-problem-text).
+    """
+    # Bucket A: 5 oversampled copies of X plus one Y.
+    bucket_a = [
+        {"query": "X", "response": "from_A_1"},
+        {"query": "X", "response": "from_A_2"},
+        {"query": "X", "response": "from_A_3"},
+        {"query": "X", "response": "from_A_4"},
+        {"query": "X", "response": "from_A_5"},
+        {"query": "Y", "response": "from_A_Y"},
+    ]
+    # Bucket B: another X plus a unique Z.
+    bucket_b = [
+        {"query": "X", "response": "from_B"},
+        {"query": "Z", "response": "from_B_Z"},
+    ]
+    combined = bucket_a + bucket_b
+    deduped = dedup_by_problem_text(combined)
+    # 8 inputs (6 + 2) → 3 unique problems.
+    assert len(deduped) == 3
+    # X appears exactly once, kept from bucket A's first occurrence.
+    x_rows = [r for r in deduped if r["query"] == "X"]
+    assert len(x_rows) == 1
+    assert x_rows[0]["response"] == "from_A_1"
+    # B's copy of X is dropped.
+    assert all(r["response"] != "from_B" for r in deduped)
+    # Y (A-only) and Z (B-only) both survive.
+    queries = {r["query"] for r in deduped}
+    assert {"X", "Y", "Z"} == queries
+
+
+def test_v4_mix_auto_max_formatted_tokens(monkeypatch, tmp_path, capsys):
+    """When --source v4-mix is selected, max_formatted_tokens auto-
+    defaults to V4_MAX_FORMATTED_TOKENS_DEFAULT (2900), NOT the v2/v3
+    default of 3500. Operators must explicitly override with
+    --max-formatted-tokens to disable the OOM safety cap.
+
+    We exercise the resolution logic indirectly by reading the constant
+    AND asserting the v2/v3 default differs (3500 → 2900 is the
+    documented tightening for v4).
+    """
+    # The constant is what main() uses for the auto-default.
+    assert V4_MAX_FORMATTED_TOKENS_DEFAULT == 2900
+    # And it's tighter than the v2/v3 default of 3500 (locked check —
+    # if someone widens this without thinking, OOM-fix regression alarm).
+    assert V4_MAX_FORMATTED_TOKENS_DEFAULT < 3500
+
+
+def test_v4_mix_boxed_answer_appending():
+    """normalize_math_train_row extracts the gold from the solution via
+    the team evaluate/ module's answer extraction, then APPENDS
+    \\boxed{gold} to the response. This guarantees extract_last_boxed
+    (used later in build_pipeline) finds the gold deterministically,
+    even when the source solution had a malformed or differently-placed
+    boxed expression.
+    """
+    raw = _v4_math_row(
+        problem="What is 7+5?",
+        gold="12",
+        subject="Prealgebra",
+        level=1,
+    )
+    norm = normalize_math_train_row(raw)
+    assert norm is not None
+    # Subject + level propagate.
+    assert norm["subject"] == "Prealgebra"
+    assert norm["level"] == "Level 1"
+    # The response ends with an appended boxed answer.
+    assert norm["response"].rstrip().endswith(r"\boxed{12}")
+    # And the query is the original problem.
+    assert norm["query"] == "What is 7+5?"
+
+
+def test_v4_mix_normalize_math_train_handles_separate_answer_field():
+    """Some MATH forks (HF MATH-500 variants) carry the answer in a
+    separate 'answer' field instead of a \\boxed{} in the solution. The
+    normalizer must accept either shape — falling back to the answer
+    field when the solution has no extractable box."""
+    raw = {
+        "problem": "Compute 2+2.",
+        "solution": "The result is straightforward — 4.",
+        "answer": "4",
+        "type": "Algebra",
+        "level": 1,
+    }
+    norm = normalize_math_train_row(raw)
+    assert norm is not None
+    assert norm["response"].rstrip().endswith(r"\boxed{4}")
+
+
+def test_v4_mix_normalize_math_train_handles_subject_variant():
+    """'Counting and Probability' (some forks) canonicalizes to
+    'Counting & Probability' to match diagnose_v3.MATH_SUBJECTS."""
+    raw = _v4_math_row(
+        problem="p", gold="1",
+        subject="Counting and Probability", level=2,
+    )
+    norm = normalize_math_train_row(raw)
+    assert norm is not None
+    assert norm["subject"] == "Counting & Probability"
+
+
+def test_v4_mix_normalize_numinamath_filters_via_callsite():
+    """normalize_numinamath_row drops rows with no extractable gold.
+    The olympiad-source filter is applied at the call site in main()
+    (pre-filter), not inside the normalizer — verified here by feeding
+    a syntactically valid row and asserting it normalizes.
+    """
+    raw = {
+        "problem": "Olympiad problem.",
+        "solution": r"The answer is \boxed{1729}.",
+        "source": "olympiads",
+    }
+    norm = normalize_numinamath_row(raw)
+    assert norm is not None
+    assert norm["query"] == "Olympiad problem."
+    assert norm["response"].rstrip().endswith(r"\boxed{1729}")
+
+    # A row without a parseable gold gets dropped.
+    bad = {"problem": "p", "solution": "no box here", "source": "olympiads"}
+    assert normalize_numinamath_row(bad) is None
