@@ -46,6 +46,24 @@ def _run(env_overrides: dict, args: list[str], expect_exit: int = 0):
     return result
 
 
+def _extract_pod_cmd(dry_run_stdout: str) -> str:
+    """Pull the assembled pod command out of --dry-run output.
+
+    ``print_args_masked`` prints the ``runai submit`` argv one token per
+    line. The final ``/bin/bash -lc <POD_CMD>`` is at the tail; the line
+    immediately after the standalone ``-lc`` token is the pod command we
+    actually hand to bash inside the pod. Returns that line verbatim.
+    """
+    lines = dry_run_stdout.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "-lc" and i + 1 < len(lines):
+            return lines[i + 1]
+    raise AssertionError(
+        "Could not locate the '-lc' marker in dry-run output. "
+        "submit_*.sh may have changed its print_args_masked layout."
+    )
+
+
 def test_placeholder_gaspar_exits_one():
     """``GASPAR=gaspar`` is the placeholder string from RCP_GUIDE; the
     script must refuse rather than submit a job named after the
@@ -177,3 +195,54 @@ def test_skip_prep_unset_keeps_prepare_sft_call():
     )
     assert "python data/prepare_sft.py" in result.stdout
     assert "python scripts/train_sft.py" in result.stdout
+
+
+# =============================================================================
+# Shell-quoting regression guard. The assembled POD_CMD is handed to
+# ``/bin/bash -lc`` inside the pod; a quoting bug in any of the chained
+# python -c / pip / cd invocations would die at ``bash -n`` time, well
+# before pip install runs. We extract the literal POD_CMD from --dry-run
+# output and feed it to ``bash -n`` to catch this class of regression
+# locally rather than 30 min into a real pod launch.
+# =============================================================================
+
+def test_pod_cmd_passes_bash_syntax_check():
+    result = _run(
+        {"GASPAR": "erbland", "GROUP": "g65"},
+        ["--dry-run"],
+    )
+    pod_cmd = _extract_pod_cmd(result.stdout)
+    syntax = subprocess.run(
+        ["bash", "-n", "-c", pod_cmd],
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, (
+        f"POD_CMD failed bash -n syntax check:\n"
+        f"  exit:   {syntax.returncode}\n"
+        f"  stderr: {syntax.stderr}\n"
+        f"  POD_CMD: {pod_cmd}"
+    )
+
+
+def test_pod_cmd_liger_sanity_check_uses_safe_quoting():
+    """The Liger Kernel sanity check must use outer double / inner single
+    quotes around the python -c argument. The nested-double-quote form
+    (`print("...")` inside `python -c "..."`) tears the outer string
+    apart and emits `syntax error near unexpected token \\`('` from
+    bash. Pin the corrected form so a regression can't slip through."""
+    result = _run(
+        {"GASPAR": "erbland", "GROUP": "g65"},
+        ["--dry-run"],
+    )
+    pod_cmd = _extract_pod_cmd(result.stdout)
+    # The exact post-evaluation form bash sees:
+    expected = (
+        "python -c \"import liger_kernel; "
+        "from liger_kernel.transformers import apply_liger_kernel_to_qwen3; "
+        "print('liger_kernel imported OK (Qwen3 patch available)')\""
+    )
+    assert expected in pod_cmd, (
+        f"Liger sanity check is not in the expected outer-double/inner-"
+        f"single-quote form. POD_CMD slice:\n  {pod_cmd}"
+    )

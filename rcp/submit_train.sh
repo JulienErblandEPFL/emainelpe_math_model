@@ -140,7 +140,7 @@ POD_CMD+=" && pip install -r requirements.txt"
 # train_sft.py launches). See submit_train_v4.sh for the rationale.
 # liger-kernel 0.8.0 doesn't expose __version__; the Qwen3-patch import
 # validates the model-specific entry point we actually use.
-POD_CMD+=" && python -c 'import liger_kernel; from liger_kernel.transformers import apply_liger_kernel_to_qwen3; print(\"liger_kernel imported OK (Qwen3 patch available)\")'"
+POD_CMD+=" && python -c \"import liger_kernel; from liger_kernel.transformers import apply_liger_kernel_to_qwen3; print('liger_kernel imported OK (Qwen3 patch available)')\""
 # Skip prepare_sft.py when SKIP_PREP is set — used when DATA_OUT_DIR
 # already contains v2/v3 data prepared offline; running the default v1
 # prep would clobber it.

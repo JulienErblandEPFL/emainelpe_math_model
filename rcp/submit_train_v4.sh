@@ -162,7 +162,7 @@ POD_CMD+=" && pip install -r requirements.txt"
 # support trips here, not 30 min later at the train_sft.py preflight.
 # liger-kernel 0.8.0 does NOT expose a __version__ attribute, so we
 # check importability only.
-POD_CMD+=" && python -c 'import liger_kernel; from liger_kernel.transformers import apply_liger_kernel_to_qwen3; print(\"liger_kernel imported OK (Qwen3 patch available)\")'"
+POD_CMD+=" && python -c \"import liger_kernel; from liger_kernel.transformers import apply_liger_kernel_to_qwen3; print('liger_kernel imported OK (Qwen3 patch available)')\""
 if [[ -z "${SKIP_PREP:-}" ]]; then
   POD_CMD+=" && python data/prepare_sft.py ${PREP_FLAGS}"
 fi

@@ -49,6 +49,19 @@ def _run(env_overrides: dict, args: list[str], expect_exit: int = 0):
     return result
 
 
+def _extract_pod_cmd(dry_run_stdout: str) -> str:
+    """Pull the assembled pod command out of --dry-run output. See the
+    twin helper in test_submit_train.py for the rationale."""
+    lines = dry_run_stdout.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "-lc" and i + 1 < len(lines):
+            return lines[i + 1]
+    raise AssertionError(
+        "Could not locate the '-lc' marker in dry-run output. "
+        "submit_rlvr.sh may have changed its print_args_masked layout."
+    )
+
+
 # =============================================================================
 # Placeholder validation — same protections as submit_train.sh.
 # =============================================================================
@@ -193,3 +206,44 @@ def test_token_masking_in_dry_run():
     assert "wandb_secret_value" not in result.stdout
     assert "HF_TOKEN=<set>" in result.stdout
     assert "WANDB_API_KEY=<set>" in result.stdout
+
+
+# =============================================================================
+# Shell-quoting regression guard — see test_submit_train.py for rationale.
+# =============================================================================
+
+def test_pod_cmd_passes_bash_syntax_check():
+    result = _run(
+        {"GASPAR": "erbland", "GROUP": "g65"},
+        ["--dry-run"],
+    )
+    pod_cmd = _extract_pod_cmd(result.stdout)
+    syntax = subprocess.run(
+        ["bash", "-n", "-c", pod_cmd],
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, (
+        f"POD_CMD failed bash -n syntax check:\n"
+        f"  exit:   {syntax.returncode}\n"
+        f"  stderr: {syntax.stderr}\n"
+        f"  POD_CMD: {pod_cmd}"
+    )
+
+
+def test_pod_cmd_liger_sanity_check_uses_safe_quoting():
+    """Pin the corrected outer-double/inner-single quoting form."""
+    result = _run(
+        {"GASPAR": "erbland", "GROUP": "g65"},
+        ["--dry-run"],
+    )
+    pod_cmd = _extract_pod_cmd(result.stdout)
+    expected = (
+        "python -c \"import liger_kernel; "
+        "from liger_kernel.transformers import apply_liger_kernel_to_qwen3; "
+        "print('liger_kernel imported OK (Qwen3 patch available)')\""
+    )
+    assert expected in pod_cmd, (
+        f"Liger sanity check is not in the expected outer-double/inner-"
+        f"single-quote form. POD_CMD slice:\n  {pod_cmd}"
+    )
