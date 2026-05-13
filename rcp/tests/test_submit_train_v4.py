@@ -137,7 +137,7 @@ def test_submit_train_v4_resume_dry_run():
 
 
 # =============================================================================
-# Shell-quoting regression guard — see test_submit_train.py for rationale.
+# Shell-syntax regression guard — see test_submit_train.py for rationale.
 # =============================================================================
 
 def test_pod_cmd_passes_bash_syntax_check():
@@ -159,22 +159,3 @@ def test_pod_cmd_passes_bash_syntax_check():
             f"  stderr: {syntax.stderr}\n"
             f"  POD_CMD: {pod_cmd}"
         )
-
-
-def test_pod_cmd_liger_sanity_check_uses_safe_quoting():
-    """Pin the corrected outer-double/inner-single quoting form. See
-    test_submit_train.py for the failure-mode rationale."""
-    result = _run(
-        {"GASPAR": "erbland", "GROUP": "g65"},
-        ["fresh", "--dry-run"],
-    )
-    pod_cmd = _extract_pod_cmd(result.stdout)
-    expected = (
-        "python -c \"import liger_kernel; "
-        "from liger_kernel.transformers import apply_liger_kernel_to_qwen3; "
-        "print('liger_kernel imported OK (Qwen3 patch available)')\""
-    )
-    assert expected in pod_cmd, (
-        f"Liger sanity check is not in the expected outer-double/inner-"
-        f"single-quote form. POD_CMD slice:\n  {pod_cmd}"
-    )

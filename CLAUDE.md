@@ -415,9 +415,12 @@ weights), so the Phase 3 merge contract is unchanged.
 
 **Default ON** (both `scripts/train_sft.py` and `scripts/train_rlvr.py`):
 `--use-liger-kernel` is the default; pass `--no-use-liger-kernel` for
-A/B comparison. Both scripts also assert `import liger_kernel` succeeds
-at startup so a broken install fails in seconds, not 30 minutes into the
-run.
+A/B comparison. We rely on the implicit chain to surface broken installs:
+the pod's `pip install -r requirements.txt` dies with a clear error if
+the wheel is unavailable, and TRL's `SFTConfig.use_liger_kernel=True`
+import-and-patches Qwen3 at trainer construction — an ImportError there
+crashes the run within a few seconds of model loading, long before any
+real training cost is incurred.
 
 ### Secondary mitigation: `PYTORCH_ALLOC_CONF=expandable_segments:True`
 

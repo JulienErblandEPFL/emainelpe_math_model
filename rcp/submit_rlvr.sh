@@ -168,12 +168,6 @@ CURATION_FLAGS+=" --difficulty-hi ${DIFFICULTY_MAX}"
 POD_CMD="ln -sf \"\$(command -v python3)\" /usr/local/bin/python"
 POD_CMD+=" && cd ${REPO_DIR}"
 POD_CMD+=" && pip install -r requirements.txt"
-# Liger Kernel sanity check: same fail-fast as the SFT submit scripts.
-# GRPO rollouts can hit the same logits-tensor OOM as SFT batches, so
-# Liger is the primary OOM mitigation here too. liger-kernel 0.8.0
-# doesn't expose __version__; the Qwen3-patch import validates the
-# model-specific entry point we actually use.
-POD_CMD+=" && python -c \"import liger_kernel; from liger_kernel.transformers import apply_liger_kernel_to_qwen3; print('liger_kernel imported OK (Qwen3 patch available)')\""
 if [[ -z "${SKIP_CURATION}" ]]; then
   POD_CMD+=" && python data/prepare_rlvr.py ${CURATION_FLAGS}"
 fi

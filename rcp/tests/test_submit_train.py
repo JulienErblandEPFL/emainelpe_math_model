@@ -198,12 +198,12 @@ def test_skip_prep_unset_keeps_prepare_sft_call():
 
 
 # =============================================================================
-# Shell-quoting regression guard. The assembled POD_CMD is handed to
-# ``/bin/bash -lc`` inside the pod; a quoting bug in any of the chained
-# python -c / pip / cd invocations would die at ``bash -n`` time, well
-# before pip install runs. We extract the literal POD_CMD from --dry-run
-# output and feed it to ``bash -n`` to catch this class of regression
-# locally rather than 30 min into a real pod launch.
+# Shell-syntax regression guard. The assembled POD_CMD is handed to
+# ``/bin/bash -lc`` inside the pod; a quoting bug anywhere in the chained
+# pip / python invocations would die at ``bash -n`` time, well before pip
+# install runs. We extract the literal POD_CMD from --dry-run output and
+# feed it to ``bash -n`` to catch this class of regression locally rather
+# than 30 min into a real pod launch.
 # =============================================================================
 
 def test_pod_cmd_passes_bash_syntax_check():
@@ -222,27 +222,4 @@ def test_pod_cmd_passes_bash_syntax_check():
         f"  exit:   {syntax.returncode}\n"
         f"  stderr: {syntax.stderr}\n"
         f"  POD_CMD: {pod_cmd}"
-    )
-
-
-def test_pod_cmd_liger_sanity_check_uses_safe_quoting():
-    """The Liger Kernel sanity check must use outer double / inner single
-    quotes around the python -c argument. The nested-double-quote form
-    (`print("...")` inside `python -c "..."`) tears the outer string
-    apart and emits `syntax error near unexpected token \\`('` from
-    bash. Pin the corrected form so a regression can't slip through."""
-    result = _run(
-        {"GASPAR": "erbland", "GROUP": "g65"},
-        ["--dry-run"],
-    )
-    pod_cmd = _extract_pod_cmd(result.stdout)
-    # The exact post-evaluation form bash sees:
-    expected = (
-        "python -c \"import liger_kernel; "
-        "from liger_kernel.transformers import apply_liger_kernel_to_qwen3; "
-        "print('liger_kernel imported OK (Qwen3 patch available)')\""
-    )
-    assert expected in pod_cmd, (
-        f"Liger sanity check is not in the expected outer-double/inner-"
-        f"single-quote form. POD_CMD slice:\n  {pod_cmd}"
     )
