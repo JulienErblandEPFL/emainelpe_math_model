@@ -203,6 +203,32 @@ def grpo_config_kwargs(
         "top_p": 0.95,
         "top_k": 20,
         "beta": args.kl_coef,
+        # Rescue-config knobs (added 2026-05-13 after the retry3 regression).
+        # Defaults below preserve pre-rescue behavior — anyone running without
+        # the new CLI flags inherits the same TRL defaults as before.
+        #   loss_type: TRL 0.19.1 default is "dapo"; "grpo" is the
+        #     alternative.  DAPO requires epsilon_high to be set; if it's
+        #     null the half-configured DAPO loss masks gradients (this was
+        #     part of the retry3 starvation).
+        #   use_vllm: when True, GRPO uses vLLM for rollouts (~5-10× faster
+        #     and the rollout temperature actually applies).  TRL default is
+        #     False — which is what retry3 used, and rollouts were the
+        #     wall-clock bottleneck.
+        #   vllm_gpu_memory_utilization: only consulted when use_vllm=True;
+        #     harmless when use_vllm=False.  Default 0.3 leaves room for the
+        #     trained policy weights on a 40 GB A100.
+        #   mask_truncated_completions: when True, GRPO masks the gradient
+        #     contribution of rollouts that hit the token cap, so the
+        #     gradient signal reflects only finished rollouts.  Critical at
+        #     short --max-new-tokens; default False matches TRL.
+        #   log_completions: dump the first few rollouts per step to W&B for
+        #     online inspection.  Bloats logs at scale but invaluable for
+        #     diagnosing the next degenerate-rollout incident.
+        "loss_type": args.loss_type,
+        "use_vllm": args.use_vllm,
+        "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+        "mask_truncated_completions": args.mask_truncated_completions,
+        "log_completions": args.log_completions,
         "bf16": precision == "bf16",
         "fp16": precision == "fp16",
         "gradient_checkpointing": True,
@@ -390,6 +416,44 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip P1/P2 preflights. ONLY for debugging the trainer wiring; "
              "running real RLVR with this set is unsupported.",
     )
+    # ---- Rescue-config knobs (added 2026-05-13). All defaults preserve the
+    # pre-rescue behavior so existing invocations are byte-stable.
+    p.add_argument(
+        "--loss-type", choices=["grpo", "dapo"], default="dapo",
+        help="GRPO loss variant. TRL 0.19.1 default is 'dapo'; 'grpo' is the "
+             "alternative used by the retry4 rescue config (DAPO without "
+             "epsilon_high is half-configured and masks gradients).",
+    )
+    p.add_argument(
+        "--use-vllm", action="store_true",
+        help="Use vLLM for GRPO rollouts. ~5-10× faster than the HF .generate "
+             "path and the rollout temperature actually takes effect. TRL "
+             "default is False; the failed retry3 run used False.",
+    )
+    p.add_argument(
+        "--vllm-gpu-memory-utilization", type=float, default=0.3,
+        help="vLLM GPU memory fraction; only consulted when --use-vllm is set. "
+             "Default 0.3 leaves room for the trained policy on a 40 GB A100.",
+    )
+    p.add_argument(
+        "--mask-truncated-completions", action="store_true",
+        help="Mask rollouts that hit the token cap from the GRPO gradient. "
+             "Critical when most rollouts truncate — without this the policy "
+             "is trained against arbitrary mid-reasoning suffixes.",
+    )
+    p.add_argument(
+        "--log-completions", action="store_true",
+        help="Log the first few rollouts per step to W&B. Useful for "
+             "diagnosing degenerate-rollout incidents in flight; bloats logs.",
+    )
+    p.add_argument(
+        "--hard-kill-on-weak-signal", action="store_true",
+        help="With this set, the reward-signal callback raises RuntimeError "
+             "(aborting training) when frac_reward_zero_std rolling mean is "
+             "> 0.5 at step 200. Without it, the callback only logs ERROR. "
+             "Use this when you want the cluster to fail fast and free the "
+             "GPU rather than burn wall-clock on a starved run.",
+    )
     p.add_argument(
         "--dry-run", action="store_true",
         help="Validate config + load prompts + print the resolved GRPOConfig "
@@ -525,6 +589,119 @@ def _is_kl_spike(
     if step >= window:
         return False
     return kl_value > threshold
+
+
+# =============================================================================
+# Reward-signal monitor — early-warn for the retry3 failure mode.
+#
+# In the failed run res35mif (2026-05-13), `frac_reward_zero_std` stayed near
+# 1.0 throughout: nearly every GRPO group had zero per-prompt reward variance,
+# so the advantage = (r - mean) / std was numerically zero on almost every
+# step. The policy barely moved (KL ≈ 0.001) for 600 steps. KLSpikeCallback
+# above watches for the OPPOSITE failure (policy exploding) — this one
+# watches for the policy STARVED. The two are independent.
+#
+# Threshold and window numbers (50-step rolling mean, warn @ step 100, error
+# @ step 200) were chosen to fire before the first checkpoint write at step
+# 50 finishes — so an operator can kill an obviously starved run inside the
+# first 5 minutes of training, not 10 hours later. See CLAUDE.md "RLVR
+# rescue plan" for the full rationale.
+# =============================================================================
+
+REWARD_SIGNAL_WINDOW_SIZE = 50
+REWARD_SIGNAL_WARN_THRESHOLD = 0.5
+REWARD_SIGNAL_WARN_STEP = 100
+REWARD_SIGNAL_ERROR_STEP = 200
+
+
+class RewardSignalCallback:
+    """Pure-Python state holder for the reward-signal monitor.
+
+    The TRL-side wrapper (built in ``_build_reward_signal_callback``)
+    forwards each ``on_log`` invocation to ``self.on_log(logs, global_step)``,
+    keeping the testable logic free of any ``transformers`` import.
+
+    Behavior:
+      - Maintain a rolling window of the most recent ``WINDOW_SIZE``
+        ``frac_reward_zero_std`` values observed in log events.
+      - At step ≥ ``WARN_STEP``, if the rolling mean exceeds
+        ``WARN_THRESHOLD``, emit a WARNING.
+      - At step ≥ ``ERROR_STEP`` with the same condition, escalate to
+        ERROR. If ``hard_kill=True``, also raise ``RuntimeError`` to
+        abort training cleanly.
+      - Silent below the warn step or when the rolling mean is healthy.
+
+    The 0.5 threshold corresponds to "more than half of GRPO groups have
+    zero per-prompt reward variance" — well into the no-gradient regime.
+    A healthy curated prompt set under the rescue config should sit at
+    ``frac_reward_zero_std ≈ 0.1-0.3`` after warmup.
+    """
+
+    WINDOW_SIZE = REWARD_SIGNAL_WINDOW_SIZE
+    WARN_THRESHOLD = REWARD_SIGNAL_WARN_THRESHOLD
+    WARN_STEP = REWARD_SIGNAL_WARN_STEP
+    ERROR_STEP = REWARD_SIGNAL_ERROR_STEP
+
+    def __init__(self, *, hard_kill: bool = False, logger_override=None):
+        self.hard_kill = hard_kill
+        self.window: list[float] = []
+        # Allow tests to capture warnings/errors via caplog by routing
+        # through the module logger; production callers can override.
+        self._logger = logger_override if logger_override is not None else logger
+
+    def on_log(self, logs: dict | None, global_step: int) -> None:
+        """Process one log event. Side effects only — emits log records and,
+        when ``hard_kill=True`` at step ≥ ``ERROR_STEP``, raises RuntimeError.
+
+        ``logs`` may be None or empty (the trainer fires on_log for many
+        event types, not all of which carry the GRPO reward stats); those
+        cases are no-ops.
+        """
+        if not logs:
+            return
+        val = logs.get("frac_reward_zero_std")
+        if val is None:
+            return
+        self.window.append(float(val))
+        if len(self.window) > self.WINDOW_SIZE:
+            self.window.pop(0)
+        if global_step < self.WARN_STEP:
+            return
+        rolling_mean = sum(self.window) / len(self.window)
+        if rolling_mean <= self.WARN_THRESHOLD:
+            return
+        msg = (
+            f"SIGNAL WEAK: frac_reward_zero_std rolling mean = "
+            f"{rolling_mean:.2f} at step {global_step}. "
+            "Most GRPO groups have zero variance — gradient is near-zero. "
+            "Consider killing and re-curating prompts with tighter "
+            "difficulty band."
+        )
+        if global_step >= self.ERROR_STEP:
+            self._logger.error(msg)
+            if self.hard_kill:
+                raise RuntimeError(msg)
+        else:
+            self._logger.warning(msg)
+
+
+def _build_reward_signal_callback(*, hard_kill: bool = False):
+    """Construct the TRL-side TrainerCallback that wraps RewardSignalCallback.
+
+    The wrapper extracts (logs, global_step) from the trainer-side call
+    signature and forwards them to the pure-Python ``RewardSignalCallback``.
+    Mirrors the ``_build_kl_spike_callback`` factory shape so the
+    transformers import stays out of CPU-only test environments.
+    """
+    from transformers import TrainerCallback
+
+    state = RewardSignalCallback(hard_kill=hard_kill)
+
+    class _RewardSignalTrainerCallback(TrainerCallback):
+        def on_log(self, args, trainer_state, control, logs=None, **kwargs):
+            state.on_log(logs, trainer_state.global_step)
+
+    return _RewardSignalTrainerCallback
 
 
 def _build_kl_spike_callback():
@@ -744,9 +921,16 @@ def main(argv: list[str] | None = None) -> int:
         processing_class=tokenizer,
     )
 
-    # P3: KL spike monitor (warn-only).
+    # P3: KL spike monitor (warn-only — Dang & Ngo 2025 policy-explosion signal).
     if not args.skip_preflights:
         trainer.add_callback(_build_kl_spike_callback()())
+        # Reward-signal monitor (warn/error/optional kill — the retry3
+        # starvation signal: frac_reward_zero_std rolling mean > 0.5).
+        # Independent of the KL spike callback above; they watch opposite
+        # failure modes.
+        trainer.add_callback(_build_reward_signal_callback(
+            hard_kill=args.hard_kill_on_weak_signal,
+        )())
 
     # ---- Train ------------------------------------------------------------
     trainer.train()

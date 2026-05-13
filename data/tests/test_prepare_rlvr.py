@@ -84,6 +84,45 @@ def test_difficulty_filter_rejects_invalid_band():
         difficulty_filter([], lo=0.0, hi=1.5)
 
 
+def test_difficulty_filter_band_is_configurable():
+    """Rescue-config support: --difficulty-lo and --difficulty-hi CLI flags
+    must parse and end-to-end drive the filter to a tighter band.
+
+    The rescue plan tightens the band from the default [0.2, 0.8] to
+    [0.35, 0.65] so curated prompts cluster around 50% solve rate — the
+    sweet spot where GRPO has the strongest per-prompt reward variance.
+    This test confirms the flag→args→filter chain works without code
+    changes (the flags already exist on prepare_rlvr.py since 2026-05-09).
+    """
+    # 1. CLI parsing: the flags exist and pick up custom values.
+    args = _parse_args([
+        "--difficulty-lo", "0.35",
+        "--difficulty-hi", "0.65",
+    ])
+    assert args.difficulty_lo == 0.35
+    assert args.difficulty_hi == 0.65
+
+    # 2. End-to-end: filter respects the parsed band.
+    rows = [
+        {"solve_rate": 0.10, "id": "below"},
+        {"solve_rate": 0.30, "id": "below_new_lo"},
+        {"solve_rate": 0.35, "id": "exact_lo"},
+        {"solve_rate": 0.50, "id": "middle"},
+        {"solve_rate": 0.65, "id": "exact_hi"},
+        {"solve_rate": 0.75, "id": "above_new_hi"},
+        {"solve_rate": 0.95, "id": "above"},
+    ]
+    kept_ids = [
+        r["id"] for r in difficulty_filter(rows, lo=args.difficulty_lo, hi=args.difficulty_hi)
+    ]
+    assert kept_ids == ["exact_lo", "middle", "exact_hi"]
+
+    # 3. Defaults still reflect the proposal's [0.2, 0.8] band.
+    default_args = _parse_args([])
+    assert default_args.difficulty_lo == DIFFICULTY_LO
+    assert default_args.difficulty_hi == DIFFICULTY_HI
+
+
 # =============================================================================
 # solve_rate — empirical c/n with the n=k=8 degeneracy explained in module
 # docstring.

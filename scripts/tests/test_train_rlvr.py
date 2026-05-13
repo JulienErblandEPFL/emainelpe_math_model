@@ -30,7 +30,11 @@ from scripts.train_rlvr import (
     CHAT_TEMPLATE_OPEN_MARKER,
     KL_SPIKE_THRESHOLD,
     KL_SPIKE_WINDOW_STEPS,
+    REWARD_SIGNAL_ERROR_STEP,
+    REWARD_SIGNAL_WARN_STEP,
+    REWARD_SIGNAL_WARN_THRESHOLD,
     REWARD_VARIANCE_THRESHOLD,
+    RewardSignalCallback,
     THINK_PREFIX,
     _is_kl_spike,
     _parse_args,
@@ -279,6 +283,174 @@ def test_grpo_config_kwargs_wandb_routing():
         run_name="rlvr-test", use_wandb=True,
     )
     assert out["report_to"] == "wandb"
+
+
+# =============================================================================
+# Rescue-config knobs — added 2026-05-13 after the retry3 starvation incident.
+# The "do no harm" contract: with no new CLI flags set, the kwargs dict must
+# reflect the pre-rescue defaults that match the failed run's config.
+# =============================================================================
+
+def test_grpo_config_kwargs_defaults_preserve_old_behavior():
+    """Without the new flags, kwargs must match the failed-run config so the
+    patch is byte-stable for existing invocations.
+
+    Pre-rescue values (= TRL 0.19.1 defaults that the retry3 run used):
+      loss_type='dapo', use_vllm=False, vllm_gpu_memory_utilization=0.3,
+      mask_truncated_completions=False, log_completions=False.
+    """
+    args = _parse_args(["--output-dir", "/tmp/x"])
+    out = grpo_config_kwargs(
+        args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
+        run_name="rlvr-test", use_wandb=False,
+    )
+    assert out["loss_type"] == "dapo"
+    assert out["use_vllm"] is False
+    assert out["vllm_gpu_memory_utilization"] == 0.3
+    assert out["mask_truncated_completions"] is False
+    assert out["log_completions"] is False
+
+
+def test_grpo_config_kwargs_includes_new_fields():
+    """All 5 rescue knobs flow from CLI flags into the kwargs dict."""
+    args = _parse_args([
+        "--output-dir", "/tmp/x",
+        "--loss-type", "grpo",
+        "--use-vllm",
+        "--vllm-gpu-memory-utilization", "0.45",
+        "--mask-truncated-completions",
+        "--log-completions",
+    ])
+    out = grpo_config_kwargs(
+        args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
+        run_name="rlvr-rescue", use_wandb=False,
+    )
+    assert out["loss_type"] == "grpo"
+    assert out["use_vllm"] is True
+    assert out["vllm_gpu_memory_utilization"] == 0.45
+    assert out["mask_truncated_completions"] is True
+    assert out["log_completions"] is True
+
+
+# =============================================================================
+# RewardSignalCallback — pure-Python state machine. Tests drive it directly,
+# no transformers/TrainerCallback import needed.
+# =============================================================================
+
+def _feed_window(cb: RewardSignalCallback, value: float, count: int) -> None:
+    """Pre-fill the rolling window with `count` log entries at `value`.
+
+    Each call uses global_step=0 so it accumulates into the window without
+    triggering the warn check (which requires step >= WARN_STEP).
+    """
+    for _ in range(count):
+        cb.on_log({"frac_reward_zero_std": value}, global_step=0)
+
+
+def test_reward_signal_callback_warns_at_step_100(caplog):
+    """At step 100 with rolling mean > 0.5, the callback fires a WARNING.
+
+    The window is pre-filled with 1.0 values (the retry3 signature). The
+    threshold trigger happens on the on_log() call at step=100, which is
+    when the WARN_STEP gate first opens.
+    """
+    cb = RewardSignalCallback(hard_kill=False)
+    _feed_window(cb, value=1.0, count=49)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="train_rlvr"):
+        cb.on_log({"frac_reward_zero_std": 1.0}, global_step=REWARD_SIGNAL_WARN_STEP)
+    warns = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warns) == 1
+    assert "SIGNAL WEAK" in warns[0].message
+    assert "rolling mean" in warns[0].message
+    assert f"step {REWARD_SIGNAL_WARN_STEP}" in warns[0].message
+
+
+def test_reward_signal_callback_escalates_at_step_200(caplog):
+    """At step 200 with rolling mean still > 0.5, the callback escalates
+    from WARNING to ERROR (without raising — hard_kill=False)."""
+    cb = RewardSignalCallback(hard_kill=False)
+    _feed_window(cb, value=1.0, count=49)
+    caplog.clear()
+    with caplog.at_level("ERROR", logger="train_rlvr"):
+        cb.on_log({"frac_reward_zero_std": 1.0}, global_step=REWARD_SIGNAL_ERROR_STEP)
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "SIGNAL WEAK" in errors[0].message
+    assert f"step {REWARD_SIGNAL_ERROR_STEP}" in errors[0].message
+
+
+def test_reward_signal_callback_hard_kill_when_enabled(caplog):
+    """With hard_kill=True, the step-200 escalation also raises
+    RuntimeError so the cluster job aborts cleanly rather than burning
+    wall-clock on a starved run. The ERROR log is emitted *before* the
+    raise, so operators see the diagnostic in pod logs.
+
+    With hard_kill=False (default), the same signal only logs — does not
+    raise. This is the documented difference between the two modes.
+    """
+    cb_kill = RewardSignalCallback(hard_kill=True)
+    _feed_window(cb_kill, value=1.0, count=49)
+    caplog.clear()
+    with caplog.at_level("ERROR", logger="train_rlvr"):
+        with pytest.raises(RuntimeError, match="SIGNAL WEAK"):
+            cb_kill.on_log(
+                {"frac_reward_zero_std": 1.0},
+                global_step=REWARD_SIGNAL_ERROR_STEP,
+            )
+    # The ERROR log MUST have fired before the raise.
+    assert any(r.levelname == "ERROR" and "SIGNAL WEAK" in r.message
+               for r in caplog.records)
+
+    # Same input, hard_kill=False: no raise, just an ERROR log.
+    cb_soft = RewardSignalCallback(hard_kill=False)
+    _feed_window(cb_soft, value=1.0, count=49)
+    # No exception expected:
+    cb_soft.on_log(
+        {"frac_reward_zero_std": 1.0},
+        global_step=REWARD_SIGNAL_ERROR_STEP,
+    )
+
+
+def test_reward_signal_callback_silent_when_signal_healthy(caplog):
+    """With rolling mean < 0.3 (well below WARN_THRESHOLD), no warnings
+    fire at any step — even past ERROR_STEP. This is the do-not-bother-me
+    case: a normally curated prompt set sits at frac_reward_zero_std
+    around 0.1-0.3 after warmup.
+    """
+    cb = RewardSignalCallback(hard_kill=True)  # even with hard_kill on
+    _feed_window(cb, value=0.2, count=49)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="train_rlvr"):
+        cb.on_log({"frac_reward_zero_std": 0.2}, global_step=REWARD_SIGNAL_WARN_STEP)
+        cb.on_log({"frac_reward_zero_std": 0.2}, global_step=REWARD_SIGNAL_ERROR_STEP)
+        cb.on_log({"frac_reward_zero_std": 0.2}, global_step=500)
+    # No warnings, no errors.
+    assert all(r.levelname not in ("WARNING", "ERROR") for r in caplog.records)
+
+
+def test_reward_signal_callback_ignores_logs_without_the_key():
+    """Trainer fires on_log for many event types — most don't carry the
+    GRPO reward stats. The callback must be tolerant of None/empty logs
+    and logs missing the frac_reward_zero_std key."""
+    cb = RewardSignalCallback()
+    cb.on_log(None, global_step=150)  # no-op, no raise
+    cb.on_log({}, global_step=150)
+    cb.on_log({"loss": 0.5}, global_step=150)  # different metric
+    assert cb.window == []  # nothing recorded
+
+
+def test_reward_signal_callback_silent_before_warn_step(caplog):
+    """Even with rolling mean = 1.0, the callback stays silent until
+    global_step crosses WARN_STEP. The first 50 steps of training are
+    warmup and the rolling window hasn't stabilized."""
+    cb = RewardSignalCallback()
+    _feed_window(cb, value=1.0, count=50)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="train_rlvr"):
+        cb.on_log({"frac_reward_zero_std": 1.0},
+                  global_step=REWARD_SIGNAL_WARN_STEP - 1)
+    assert all(r.levelname != "WARNING" for r in caplog.records)
 
 
 # =============================================================================

@@ -41,10 +41,26 @@
 #   LEARNING_RATE train_rlvr.py --learning-rate. Default: 3e-6
 #   KL_COEF       train_rlvr.py --kl-coef. Default: 0.04
 #   ROLLOUT_TEMP  train_rlvr.py --rollout-temp. Default: 0.8
+#   MAX_NEW_TOKENS    train_rlvr.py --max-new-tokens. Default: 4096
 #   SKIP_CURATION If "1", skip prepare_rlvr.py (use existing PROMPT_SET).
 #                 Default: empty (run curation).
 #   SKIP_PREFLIGHTS  If "1", forward --skip-preflights to train_rlvr.py.
 #                 Default: empty. ONLY for trainer-wiring debugging.
+#
+# Rescue-config env vars (added 2026-05-13 after the retry3 starvation
+# incident; see CLAUDE.md → "RLVR rescue plan"). All defaults preserve the
+# pre-rescue behavior so existing invocations are byte-stable.
+#   LOSS_TYPE             train_rlvr.py --loss-type {grpo,dapo}. Default: dapo
+#   USE_VLLM              If set, forward --use-vllm. Default: empty (False).
+#   VLLM_GPU_MEM_UTIL     train_rlvr.py --vllm-gpu-memory-utilization.
+#                         Default: 0.3 (only consulted when USE_VLLM is set).
+#   MASK_TRUNCATED        If set, forward --mask-truncated-completions.
+#                         Default: empty (False).
+#   LOG_COMPLETIONS       If set, forward --log-completions. Default: empty.
+#   HARD_KILL_ON_WEAK_SIGNAL  If set, forward --hard-kill-on-weak-signal.
+#                         Default: empty (callback only logs ERROR).
+#   DIFFICULTY_MIN        prepare_rlvr.py --difficulty-lo. Default: 0.2
+#   DIFFICULTY_MAX        prepare_rlvr.py --difficulty-hi. Default: 0.8
 
 set -euo pipefail
 
@@ -57,8 +73,19 @@ TARGET_SIZE="${TARGET_SIZE:-5000}"
 LEARNING_RATE="${LEARNING_RATE:-3e-6}"
 KL_COEF="${KL_COEF:-0.04}"
 ROLLOUT_TEMP="${ROLLOUT_TEMP:-0.8}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
 SKIP_CURATION="${SKIP_CURATION:-}"
 SKIP_PREFLIGHTS="${SKIP_PREFLIGHTS:-}"
+
+# ----- Rescue-config defaults (preserve pre-rescue behavior). ------------
+LOSS_TYPE="${LOSS_TYPE:-dapo}"
+USE_VLLM="${USE_VLLM:-}"
+VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.3}"
+MASK_TRUNCATED="${MASK_TRUNCATED:-}"
+LOG_COMPLETIONS="${LOG_COMPLETIONS:-}"
+HARD_KILL_ON_WEAK_SIGNAL="${HARD_KILL_ON_WEAK_SIGNAL:-}"
+DIFFICULTY_MIN="${DIFFICULTY_MIN:-0.2}"
+DIFFICULTY_MAX="${DIFFICULTY_MAX:-0.8}"
 
 # ----- Argument parsing --------------------------------------------------
 DRY_RUN=0
@@ -120,6 +147,13 @@ TRAIN_FLAGS+=" --learning-rate ${LEARNING_RATE}"
 TRAIN_FLAGS+=" --kl-coef ${KL_COEF}"
 TRAIN_FLAGS+=" --rollout-temp ${ROLLOUT_TEMP}"
 TRAIN_FLAGS+=" --max-prompts ${MAX_PROMPTS}"
+TRAIN_FLAGS+=" --max-new-tokens ${MAX_NEW_TOKENS}"
+TRAIN_FLAGS+=" --loss-type ${LOSS_TYPE}"
+TRAIN_FLAGS+=" --vllm-gpu-memory-utilization ${VLLM_GPU_MEM_UTIL}"
+TRAIN_FLAGS+="${USE_VLLM:+ --use-vllm}"
+TRAIN_FLAGS+="${MASK_TRUNCATED:+ --mask-truncated-completions}"
+TRAIN_FLAGS+="${LOG_COMPLETIONS:+ --log-completions}"
+TRAIN_FLAGS+="${HARD_KILL_ON_WEAK_SIGNAL:+ --hard-kill-on-weak-signal}"
 TRAIN_FLAGS+="${SKIP_PREFLIGHTS:+ --skip-preflights}"
 
 CURATION_FLAGS="--input-jsonl ${DATA_OUT_DIR}/train.jsonl"
@@ -127,6 +161,8 @@ CURATION_FLAGS+=" --sft-model-path ${SFT_MODEL}"
 CURATION_FLAGS+=" --output-jsonl ${PROMPT_SET}"
 CURATION_FLAGS+=" --pool-size ${POOL_SIZE}"
 CURATION_FLAGS+=" --target-size ${TARGET_SIZE}"
+CURATION_FLAGS+=" --difficulty-lo ${DIFFICULTY_MIN}"
+CURATION_FLAGS+=" --difficulty-hi ${DIFFICULTY_MAX}"
 
 # ----- The in-pod command -----------------------------------------------
 POD_CMD="ln -sf \"\$(command -v python3)\" /usr/local/bin/python"
@@ -189,8 +225,19 @@ if (( DRY_RUN )); then
   echo "LEARNING_RATE  : ${LEARNING_RATE}"
   echo "KL_COEF        : ${KL_COEF}"
   echo "ROLLOUT_TEMP   : ${ROLLOUT_TEMP}"
+  echo "MAX_NEW_TOKENS : ${MAX_NEW_TOKENS}"
   echo "SKIP_CURATION  : ${SKIP_CURATION:-<unset>}"
   echo "SKIP_PREFLIGHTS: ${SKIP_PREFLIGHTS:-<unset>}"
+  echo
+  echo "--- Rescue config (defaults preserve pre-rescue behavior) ---"
+  echo "LOSS_TYPE                : ${LOSS_TYPE}"
+  echo "USE_VLLM                 : ${USE_VLLM:-<unset>}"
+  echo "VLLM_GPU_MEM_UTIL        : ${VLLM_GPU_MEM_UTIL}"
+  echo "MASK_TRUNCATED           : ${MASK_TRUNCATED:-<unset>}"
+  echo "LOG_COMPLETIONS          : ${LOG_COMPLETIONS:-<unset>}"
+  echo "HARD_KILL_ON_WEAK_SIGNAL : ${HARD_KILL_ON_WEAK_SIGNAL:-<unset>}"
+  echo "DIFFICULTY_MIN           : ${DIFFICULTY_MIN}"
+  echo "DIFFICULTY_MAX           : ${DIFFICULTY_MAX}"
   echo
   echo "Assembled command (one arg per line, secrets masked):"
   print_args_masked

@@ -79,6 +79,106 @@ Then in week 4 (team work, not part of this repo): DARE → AdaMerging merge.
 | RLVR experiment outcome | **v3 SFT remains the production checkpoint** | Trained 600 GRPO steps (~16% of one epoch on 3919 difficulty-curated prompts) on 2026-05-13 before stopping for wall-clock. Resulting RLVR-v3 regressed pass@8 from 0.40 → 0.30 on `validation_samples/math.jsonl`. Not pushed to HF. Five integration bugs were fixed during the run (sys.path, TRL 0.19.1 GRPOConfig API drift, raw-prompt JSONL, missing `<think>\n` prefix, false-alarm preflight reading) — all surfaced as fail-fast preflight assertions and regression tests (240 → 252 tests). See `IMPLEMENTATION_PLAN.md` → Stage 7 + "Lessons learned" → "2026-05-12/13 — RLVR 5-bug arc". |
 | Cap-mode parity | ci-faithful (max_tokens=4096) ≡ final-grading (max_tokens=16384) on our checkpoints | 2026-05-13: all three evaluated models (bare, v3 SFT, RLVR-v3) produce identical pass@8 under both cap modes on `validation_samples/math.jsonl`. Completions terminate naturally before 4096 tokens; truncation is not the binding constraint on this set. The TA's final-grading bump does not lift our headline. Re-check if a future variant has markedly longer reasoning chains. |
 
+## RLVR rescue plan (post-retry3 starvation, 2026-05-13)
+
+The 2026-05-13 RLVR run `res35mif` regressed the SFT base from pass@8=0.40
+to 0.30 over 600 GRPO steps. **Root cause**: `frac_reward_zero_std`
+stayed at ≈1.0 throughout — nearly every GRPO group had zero per-prompt
+reward variance, so the advantage `(r - mean) / std` was numerically
+zero on most steps. The policy barely moved (KL ≈ 0.001) for the entire
+600-step run. Combined with `loss_type=dapo` (with `epsilon_high=null` —
+half-configured DAPO masks gradients further), `use_vllm=False`,
+`mask_truncated_completions=False`, and `learning_rate=3e-6`, the run was
+gradient-starved from step 1.
+
+This patch (2026-05-13) makes the rescue config invocable via env vars
+without changing any defaults. The five rescue levers, in priority order:
+
+1. **Tighten the difficulty band** (`DIFFICULTY_MIN=0.35 DIFFICULTY_MAX=0.65`).
+   Root-cause fix for `frac_reward_zero_std≈1.0`: curated prompts cluster
+   around ~50% solve rate where per-prompt reward variance is highest.
+   Prompts at solve_rate 0.2 or 0.8 contribute almost nothing to the
+   gradient under n=8 rollouts.
+2. **Switch to vLLM rollouts** (`USE_VLLM=1`). ~5-10× faster than the HF
+   `.generate` path and the rollout `temperature` actually takes effect
+   (the HF path silently ignores it under some TRL configurations).
+   Wall-clock unlock; also fixes the rollout-temp drift hypothesis.
+3. **Mask truncated completions** (`MASK_TRUNCATED=1`). When most
+   rollouts hit the token cap (as in retry3), the gradient is being
+   computed against arbitrary mid-reasoning suffixes. Masking them
+   restricts gradient to finished rollouts only.
+4. **Use plain GRPO loss** (`LOSS_TYPE=grpo`). DAPO needs `epsilon_high`
+   configured to work; the half-configured DAPO in retry3 masked
+   additional gradients. Switching to plain GRPO until `epsilon_high`
+   is intentionally tuned.
+5. **Raise learning rate** (`LEARNING_RATE=1e-5`). At 3e-6 with a starved
+   gradient, 600 steps of training moved policy weights almost nowhere
+   (KL≈0.001). A 3× LR bump gives the policy a chance to move past the
+   SFT optimum under a healthier reward signal.
+
+### Two preflight callbacks watching opposite failure modes
+
+- `KLSpikeCallback` (P3, pre-existing): WARNs if KL > 0.5 within the
+  first 100 steps — Dang & Ngo 2025's policy-explosion signal.
+- `RewardSignalCallback` (added 2026-05-13): WARNs at step 100 / ERRORs
+  at step 200 if `frac_reward_zero_std` rolling-50-step mean > 0.5 —
+  the retry3 starvation signal. With `HARD_KILL_ON_WEAK_SIGNAL=1` the
+  step-200 escalation raises RuntimeError to abort the run cleanly
+  (free the A100 instead of burning wall-clock on a dead run).
+
+The two callbacks are independent. A healthy run should see neither.
+A polluted prompt set (or a half-configured DAPO loss) trips the
+reward-signal callback. An over-aggressive learning rate or KL coefficient
+trips the KL callback.
+
+### Exact rescue invocation (paste-ready)
+
+```bash
+USE_VLLM=1 \
+VLLM_GPU_MEM_UTIL=0.4 \
+MASK_TRUNCATED=1 \
+LOG_COMPLETIONS=1 \
+LOSS_TYPE=grpo \
+LEARNING_RATE=1e-5 \
+DIFFICULTY_MIN=0.35 \
+DIFFICULTY_MAX=0.65 \
+MAX_NEW_TOKENS=2048 \
+GASPAR=erbland GROUP=g65 ./rcp/submit_rlvr.sh rescue
+```
+
+The `rescue` positional arg becomes the run-name suffix
+(`cs552-erbland-g65-rescue-<timestamp>`), so the rescue run is
+distinguishable from prior `rlvr-*` attempts in W&B and HF.
+
+**Hard-kill is OFF for the first rescue run.** The
+`RewardSignalCallback` still logs WARN @ step 100 and ERROR @ step 200
+if `frac_reward_zero_std` rolling mean stays > 0.5, but it does NOT
+abort the job. This lets us observe the full `frac_reward_zero_std`
+trajectory across a complete run — we need that healthy baseline before
+we know what threshold value is operationally tight vs spurious. Future
+rescue runs can append `HARD_KILL_ON_WEAK_SIGNAL=1` once we've seen the
+trajectory on a known-good run and the 0.5 threshold is calibrated.
+
+**Expected curation yield.** Under the tighter `[0.35, 0.65]` band,
+expect roughly **1500–2500 prompts** kept from a 10k pool (down from
+~3900 at the proposal's `[0.2, 0.8]` band). If the curation pass yields
+fewer than 1000 in-band prompts, either raise `POOL_SIZE=20000` to
+double the candidate set or relax the band to `[0.30, 0.70]`. Below
+~1000 prompts the run is short on diversity and the gradient signal
+becomes a function of which specific problems landed in-band, not the
+ability v3 SFT has to learn from the regime.
+
+### Curation/rollout alignment
+
+`data/prepare_rlvr.py` scores difficulty at `SCORING_NUM_GENERATIONS=8`
+— byte-identical to `train_rlvr.py`'s `--num-generations 8` default.
+Curation-time solve_rate is therefore a direct predictor of
+in-training per-prompt reward variance at the same n. **Do not break
+this alignment** by setting different `n` values on the two scripts;
+the difficulty band's empirical guarantee depends on it.
+
+---
+
 ## Locked shared files
 
 `configs/lora.yaml` and `chat_template/chat_template.jinja` are copied from
