@@ -11,6 +11,7 @@ import random
 import pytest
 
 from prepare_sft import (
+    MATH_TRAIN_SUBJECTS,
     V4_MAX_FORMATTED_TOKENS_DEFAULT,
     apply_per_question_cap,
     build_pipeline,
@@ -18,6 +19,7 @@ from prepare_sft import (
     dedup_by_problem_text,
     extract_last_boxed,
     format_response,
+    load_math_train_all_subjects,
     make_example,
     normalize_math_train_row,
     normalize_numinamath_row,
@@ -1153,6 +1155,118 @@ def test_v4_mix_normalize_math_train_handles_subject_variant():
     norm = normalize_math_train_row(raw)
     assert norm is not None
     assert norm["subject"] == "Counting & Probability"
+
+
+def test_math_train_subjects_constant_is_the_seven_hendrycks_configs():
+    """The seven Hendrycks MATH config names — must stay in sync with
+    EleutherAI/hendrycks_math's per-subject configs. Lock the exact spelling
+    here so a typo in any caller surfaces as a test failure, not a runtime
+    HF lookup miss in production."""
+    assert MATH_TRAIN_SUBJECTS == (
+        "algebra",
+        "counting_and_probability",
+        "geometry",
+        "intermediate_algebra",
+        "number_theory",
+        "prealgebra",
+        "precalculus",
+    )
+    assert len(MATH_TRAIN_SUBJECTS) == 7
+
+
+def test_math_train_loads_all_seven_subjects():
+    """load_math_train_all_subjects calls load_dataset_fn once per subject
+    in MATH_TRAIN_SUBJECTS with the subject as the config name. The
+    concatenated dataset's rows carry the subject as the 'type' field
+    (per Hendrycks MATH schema), and the per-subject count dict echoes
+    each subset's len()."""
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_load(name, config, *, split):
+        calls.append((name, config, split))
+        # Realistic shape: each row's 'type' field carries the subject
+        # name (config). Production would use title-case for 'type', but
+        # the helper is type-agnostic — only the loader call structure
+        # is under test here.
+        return [
+            {"problem": f"p_{config}_{i}", "solution": "s", "level": 1, "type": config}
+            for i in range(2)
+        ]
+
+    def fake_concat(subsets):
+        out: list[dict] = []
+        for s in subsets:
+            out.extend(s)
+        return out
+
+    result, counts = load_math_train_all_subjects(
+        "EleutherAI/hendrycks_math",
+        "train",
+        load_dataset_fn=fake_load,
+        concatenate_fn=fake_concat,
+    )
+
+    # Loader called once per subject, in declaration order.
+    assert len(calls) == 7
+    assert [c[1] for c in calls] == list(MATH_TRAIN_SUBJECTS)
+    # All calls share the same dataset name and split.
+    assert all(c[0] == "EleutherAI/hendrycks_math" for c in calls)
+    assert all(c[2] == "train" for c in calls)
+    # Per-subject counts dict — each subject yielded 2 fake rows.
+    assert counts == {s: 2 for s in MATH_TRAIN_SUBJECTS}
+    # Concatenated result has 7 × 2 = 14 rows, each tagged with its
+    # subject in the 'type' field — what compose_math_train_buckets
+    # would then filter on after normalize_math_train_row maps 'type'
+    # to 'subject'.
+    assert len(result) == 14
+    types = {r["type"] for r in result}
+    assert types == set(MATH_TRAIN_SUBJECTS)
+
+
+def test_math_train_load_failure_identifies_subject():
+    """If one subject's load fails, the wrapping RuntimeError must name
+    which subject and which dataset broke. Tests catch this before a
+    cluster smoke run wastes wall-clock on an opaque traceback."""
+    def fake_load(name, config, *, split):
+        if config == "geometry":
+            raise FileNotFoundError("simulated HF gate")
+        return [{"problem": "p", "solution": "s", "type": config}]
+
+    def fake_concat(subsets):
+        return [r for s in subsets for r in s]
+
+    with pytest.raises(RuntimeError) as excinfo:
+        load_math_train_all_subjects(
+            "EleutherAI/hendrycks_math",
+            "train",
+            load_dataset_fn=fake_load,
+            concatenate_fn=fake_concat,
+        )
+    msg = str(excinfo.value)
+    assert "geometry" in msg  # which subject
+    assert "EleutherAI/hendrycks_math" in msg  # which dataset
+    assert "FileNotFoundError" in msg  # which error class
+    assert "simulated HF gate" in msg  # the underlying message
+
+
+def test_math_train_loads_subset_when_subjects_arg_overridden():
+    """The helper accepts a custom subjects tuple — useful for unit tests
+    that want a small slice without exercising all 7 configs."""
+    calls = []
+
+    def fake_load(name, config, *, split):
+        calls.append(config)
+        return [{"problem": "p", "type": config}]
+
+    result, counts = load_math_train_all_subjects(
+        "any/name", "train",
+        load_dataset_fn=fake_load,
+        concatenate_fn=lambda subs: [r for s in subs for r in s],
+        subjects=("algebra", "geometry"),
+    )
+    assert calls == ["algebra", "geometry"]
+    assert set(counts) == {"algebra", "geometry"}
+    assert len(result) == 2
 
 
 def test_v4_mix_normalize_numinamath_filters_via_callsite():

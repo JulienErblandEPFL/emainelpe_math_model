@@ -131,6 +131,23 @@ MATH_OTHER_SUBJECTS: tuple[str, ...] = (
     "Prealgebra",
 )
 
+# Hendrycks MATH config names — each is a separate HF dataset config, NOT
+# a row field. The loader must call load_dataset(name, subject, split=...)
+# once per subject and concatenate the results. Verified 2026-05-13: the
+# 'type' field in each row carries the human-readable subject (e.g.,
+# "Intermediate Algebra"), which is what compose_math_train_buckets
+# filters on via normalize_math_train_row's subject mapping.
+MATH_TRAIN_SUBJECTS: tuple[str, ...] = (
+    "algebra",
+    "counting_and_probability",
+    "geometry",
+    "intermediate_algebra",
+    "number_theory",
+    "prealgebra",
+    "precalculus",
+)
+
+
 # NuminaMath ``source`` field values that count as olympiad-style. Used
 # to filter the 860k-row CoT split down to the subset we want in v4.
 #
@@ -316,6 +333,53 @@ def _math_level_to_string(level: int | str | None) -> str | None:
     if s.isdigit():
         return f"Level {s}"
     return s  # passthrough — exotic but don't drop the row over it
+
+
+def load_math_train_all_subjects(
+    dataset_name: str,
+    split: str,
+    *,
+    load_dataset_fn: Callable,
+    concatenate_fn: Callable,
+    subjects: tuple[str, ...] = MATH_TRAIN_SUBJECTS,
+) -> tuple[object, dict[str, int]]:
+    """Load each Hendrycks MATH subject as a separate config and concatenate.
+
+    EleutherAI/hendrycks_math (and lighteval/MATH) ship each MATH subject
+    as a distinct HF dataset config — calling ``load_dataset(name,
+    split="train")`` without a config name fails because there is no
+    "default" config. The loader MUST iterate the 7 subjects in
+    ``MATH_TRAIN_SUBJECTS`` and concatenate.
+
+    ``load_dataset_fn`` and ``concatenate_fn`` are dependency-injected so
+    this helper can be tested on a laptop without the ``datasets``
+    package installed. In production, callers pass
+    ``datasets.load_dataset`` and ``datasets.concatenate_datasets``.
+
+    Returns ``(concatenated_dataset, per_subject_counts)``. The dict
+    keys are exactly the values in ``subjects``; the int values are
+    ``len(...)`` of each loaded subset. Raises ``RuntimeError`` with a
+    message identifying which subject's load failed if any
+    ``load_dataset_fn`` call raises.
+    """
+    subsets = []
+    counts: dict[str, int] = {}
+    for subject in subjects:
+        try:
+            subset = load_dataset_fn(dataset_name, subject, split=split)
+        except Exception as e:
+            raise RuntimeError(
+                f"v4-mix MATH-train: failed to load subject {subject!r} "
+                f"from {dataset_name!r} (split={split!r}): {type(e).__name__}: {e}"
+            ) from e
+        subsets.append(subset)
+        try:
+            counts[subject] = len(subset)
+        except TypeError:
+            # IterableDataset doesn't support len(); record as -1 so
+            # caller can log "unknown" instead of crashing.
+            counts[subject] = -1
+    return concatenate_fn(subsets), counts
 
 
 def normalize_math_train_row(raw: dict) -> dict | None:
@@ -1012,11 +1076,32 @@ def main() -> None:
         )
 
         # ---- Source 2: MATH-train buckets ----
+        # Hendrycks MATH ships each subject as a separate HF config —
+        # load_dataset(name, split=...) without a config name fails.
+        # We loop the 7 subjects via load_math_train_all_subjects and
+        # concatenate. Per-subject INFO logs surface the load yield so
+        # operator can sanity-check before composing buckets.
+        from datasets import concatenate_datasets  # type: ignore
+
         logger.info(
-            "v4-mix: loading MATH-train from %s split=%s",
-            args.math_train_name, args.math_train_split,
+            "v4-mix: loading MATH-train from %s split=%s across %d subjects",
+            args.math_train_name, args.math_train_split, len(MATH_TRAIN_SUBJECTS),
         )
-        math_ds = load_dataset(args.math_train_name, split=args.math_train_split)
+        math_ds, math_subject_counts = load_math_train_all_subjects(
+            args.math_train_name,
+            args.math_train_split,
+            load_dataset_fn=load_dataset,
+            concatenate_fn=concatenate_datasets,
+        )
+        for subject, n_rows in math_subject_counts.items():
+            logger.info(
+                "v4-mix MATH-train: loaded %s with %d rows", subject, n_rows,
+            )
+        logger.info(
+            "v4-mix MATH-train: loaded %d rows across %d subjects",
+            len(math_ds), len(math_subject_counts),
+        )
+
         math_normalized_all: list[dict] = []
         for raw in math_ds:
             norm = normalize_math_train_row(dict(raw))
