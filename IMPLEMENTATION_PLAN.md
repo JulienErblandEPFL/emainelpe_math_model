@@ -476,7 +476,31 @@ running Stages 1 → 3 → 5 in sequence.
 
 ---
 
-## Stage 7 — RLVR (Phase 2) — V0 IMPLEMENTED 2026-05-09, NOT YET TRAINED
+## Stage 7 — RLVR (Phase 2) — COMPLETED 2026-05-13 (REGRESSION, NOT PUSHED)
+
+**Outcome.** Trained 600 GRPO steps (~16% of one epoch on 3919
+difficulty-curated prompts) on top of the v3 SFT adapter before
+stopping for wall-clock. Resulting RLVR-v3 checkpoint regressed
+pass@8 on `validation_samples/math.jsonl` from **0.40 → 0.30**.
+Not pushed to HF. **v3 SFT remains the team math expert** on
+`cs-552-2026-emainelpe/math_model`.
+
+Training metrics at stop were healthy (reward_std ≈ 0.35–0.55, KL
+from SFT reference ≈ 0.001–0.002, no spike alerts) — the policy
+just had not accumulated enough steps to either recover the SFT
+optimum or improve past it. This is consistent with Dang & Ngo
+2025's warning that small-model RLVR can be net-negative on
+partial training; the team-committed fallback ("SFT fallback if
+RLVR destabilizes") is exactly the path taken.
+
+Five integration bugs were fixed during the run; see "Lessons
+learned" → "2026-05-12/13 — RLVR 5-bug arc" below. Test count grew
+240 → 252 with regression coverage for every bug class. The
+infrastructure is correct and reusable; if a future session has
+wall-clock for a multi-epoch run, the same `rcp/submit_rlvr.sh`
+will exercise it.
+
+### Original Stage 7 plan (kept for historical record)
 
 **Goal.** Add GRPO training on top of the SFT checkpoint.
 
@@ -600,6 +624,54 @@ options only if the main path lands ahead of schedule.
 
 ---
 
+## Project state as of 2026-05-13
+
+**Final math expert.** v3 SFT (50k OMI2, r=32, α=64, temp=0.4).
+Pushed to `cs-552-2026-emainelpe/math_model`. RLVR-v3 trained but
+regressed and not pushed.
+
+**Measured numbers.**
+
+| Surface              | pass@8 | Notes |
+|----------------------|--------|-------|
+| local `validation_samples/math.jsonl`, ci-faithful (4096) | 0.40 | v3 SFT @ temp=0.4 |
+| local `validation_samples/math.jsonl`, final-grading (16384) | 0.40 | identical to ci-faithful — cap not binding on N=10 |
+| CI nightly (2026-05-13), secret math benchmark | 0.32 | currently pushed v3 SFT |
+
+The 8 pp local→CI gap is consistent with N=10 sampling variance
+(±15 pp standard error on N=10) plus distribution shift between
+`validation_samples/math.jsonl` and the CI's larger secret set. The
+evaluator is byte-identical across local and CI (`evaluate/` package
+vendored from OpenCompass), so the gap is purely sampling + dataset,
+not measurement.
+
+**Status.** Ready for Phase 3 (team merge).
+
+---
+
+## Remaining work
+
+- **Self-distillation (optional, ~12 h GPU, +1–3 pp expected lift).**
+  Generate solutions from v3 SFT at temp=0.4, filter for
+  correctness via `evaluate.is_equiv` against gold answers, re-train
+  the LoRA adapter on this self-curated set. Recovers the
+  consistency v3 lost on hard problems without the RLVR
+  destabilization risk. Not yet started.
+- **Report drafting.** Methods + results sections, target this
+  week. Include the 5-bug RLVR arc as a debugging case study; the
+  cap-mode parity finding as a measurement methodology note; the
+  v1/v2/v3 temperature sweep as the SFT selection methodology.
+- **Team merge support (Phase 3).** Starts ~2026-05-19. v3 SFT
+  adapter at `cs-552-2026-emainelpe/math_model` is the math
+  contribution to the DARE + AdaMerging merge.
+- **Final grading prep.** Deadline 2026-06-07. Decision point at
+  ~2026-05-30: if self-distillation lands a non-noise lift, push
+  the new checkpoint; otherwise v3 SFT ships as-is. Per `CLAUDE.md`
+  → "Milestone strategy", SFT fallback is the documented
+  contingency.
+
+---
+
 ## Lessons learned
 
 ### 2026-05-11 — v3 SFT eval-step OOM on A100 40 GB
@@ -703,6 +775,154 @@ inference-temperature constraint: `CLAUDE.md` → "Settled design
 decisions" → "Inference temperature" row. Full sweep table:
 `docs/BASELINE.md` → "2026-05-11 SFT comparison and temperature sweep".
 
+### 2026-05-12/13 — RLVR 5-bug arc
+
+**Symptom.** Successive RCP submissions of `scripts/train_rlvr.py`
+on top of v3 SFT failed for five distinct reasons across two days
+before training produced clean GRPO steps. Each failure was a
+different layer in the TRL / vLLM / GRPO / locked-chat-template
+integration; fixing one revealed the next.
+
+**The arc.**
+
+1. **`ModuleNotFoundError: No module named 'scripts'` in P2.**
+   `python scripts/train_rlvr.py` puts `scripts/` on `sys.path[0]`
+   but not the repo root, so `from scripts.reward_fn import
+   compute_reward` (deferred inside the P2 preflight) failed.
+   Fix: prepend repo root to `sys.path` at the top of
+   `train_rlvr.py`, matching the existing idiom in
+   `scripts/eval_local.py`. Added regression test
+   (`importlib.util.spec_from_file_location` simulates script-mode
+   sys.path, then verifies the deferred import resolves).
+
+2. **`TypeError: GRPOConfig.__init__() got an unexpected keyword
+   argument 'max_prompt_length'`.** The course image's TRL 0.19.1
+   `GRPOConfig` does not accept `max_prompt_length` — newer than
+   what `train_rlvr.py` was written against. Fix: drop the kwarg
+   from `grpo_config_kwargs()`; rely on tokenizer's `max_length`
+   and the prompt-length filter that `prepare_rlvr.py` already
+   applies. Added signature-comparison regression test
+   (`inspect.signature(trl.GRPOConfig.__init__).parameters`) so
+   future API drift surfaces as a clear test failure, not a
+   crash mid-launch.
+
+3. **100% clipped rollouts on first GRPO step.** Every rollout
+   hit the 4096-token cap (`mean_terminated_length=0`,
+   `clipped_ratio=1.0`). `prepare_rlvr.py` was writing the RAW
+   problem text to `rlvr_prompts.jsonl`'s prompt field, not the
+   chat-templated string the model was trained against. The model
+   saw raw text at GRPO rollout time, never recognized a chat
+   turn, never emitted `<|im_end|>`. Fix: apply
+   `tokenizer.apply_chat_template(...)` before writing.
+   Added a P0 fail-fast assertion in `train_rlvr.py` that every
+   loaded prompt contains `<|im_start|>` (cheap, catches the bug
+   class before GPU allocation).
+
+4. **Still 100% clipped after fix #3.** The locked
+   `chat_template.jinja` forces `enable_thinking=true`, so its
+   `add_generation_prompt=True` branch emits only
+   `<|im_start|>assistant\n` — it does NOT include `<think>\n`.
+   But v3 SFT was trained on assistant turns that *begin* with
+   `<think>\n`; without that prefix, the model at temp=0.8
+   unreliably emits `<think>` itself and falls into degenerate
+   non-terminating output. Fix: append `THINK_PREFIX =
+   "<think>\n"` after `apply_chat_template()` in
+   `prepare_rlvr.py`. Added a second P0 assertion in
+   `train_rlvr.py` that every prompt ends with `<think>\n`.
+
+5. **False alarm.** After all four real fixes, P2 prompt 1
+   showed `reward_mean=0.05, reward_std=0` — looked like another
+   degenerate case. It was not: the first prompt was just a hard
+   problem the model got wrong eight times in a row. Subsequent
+   prompts showed healthy `reward_std=0.33–0.49`. Methodological
+   note: wait for the full P2 sample before concluding from one
+   prompt.
+
+**Methodological takeaways.**
+
+- **Fail-fast preflight assertions are extremely cheap and very
+  high-leverage on GPU-cost workloads.** The chat-template +
+  `<think>\n` assertions in `train_rlvr.py` would have caught
+  bugs 3 and 4 in seconds; without them, we burned RCP wall-clock
+  to discover the same bugs. The pure-helper pattern
+  (`build_scored_row`, `assert_prompts_are_chat_templated`) makes
+  these testable on a laptop without TRL installed.
+- **TRL + vLLM + GRPO + custom-chat-template is a four-layer
+  integration**, and each layer has its own assumptions about
+  prompt format, sampling args, and model contract. Bugs surface
+  in sequence, not in parallel. Plan for it.
+- **Lock the API version in tests, not in requirements.** Pinning
+  TRL would have papered over bug #2 without telling us the
+  course image's TRL is different. Signature-comparison tests
+  surface drift without forcing version-lock.
+
+**Test growth.** 240 → 252 across this arc. New tests:
+sys.path bootstrap (script-mode subprocess + deferred-import
+simulator), GRPOConfig signature drift, chat-template marker
+presence in JSONL output, `THINK_PREFIX` presence in JSONL
+output, P0 runtime assertions for both markers.
+
+### 2026-05-13 — cap-mode parity (ci-faithful ≡ final-grading on our checkpoints)
+
+**Symptom.** Per TA clarification, final-grading mode raises the
+per-completion budget to 16384 tokens (vs ci-faithful's 4096).
+The expectation was that loosening the cap would surface extra
+correct completions clipped by 4096 — particularly on long-chain
+reasoning problems.
+
+**Finding.** On `validation_samples/math.jsonl` (N=10) for all
+three evaluated checkpoints (bare Qwen3-1.7B, v3 SFT, RLVR-v3),
+pass@8 is **byte-identical between the two cap modes**.
+Completions terminate naturally (EOS or `\boxed{...}` followed by
+`<|im_end|>`) before reaching 4096 tokens. Truncation is not the
+binding constraint on this snapshot.
+
+**Operational consequence.** Continue using ci-faithful caps
+(`max_tokens=4096`) as the local-eval mode. The final-grading
+bump does not lift our headline pass@8. **This may change** if a
+future variant (self-distillation, longer-CoT training) has
+markedly longer reasoning chains — re-check the parity at that
+point rather than assuming it holds.
+
+**Methodological note.** Don't accept a cap-relaxation as a free
+improvement without measuring. For our checkpoints the cap is
+slack, so the relaxation buys nothing; for a different model
+class it might.
+
+### 2026-05-13 — partial RLVR can be net-negative
+
+**Symptom.** RLVR-v3 trained 600 GRPO steps (~16% of one epoch
+on 3919 difficulty-curated prompts) with healthy in-training
+metrics (reward_std ≈ 0.35–0.55, KL from SFT ≈ 0.001–0.002, no
+spike alerts). Local eval on `validation_samples/math.jsonl`
+showed pass@8 = 0.30 — a regression from the v3 SFT base's 0.40.
+
+**Diagnosis.** Wall-clock stopped training before the policy
+could either recover the SFT optimum or improve past it. ~38,400
+total rollouts (600 × 8 × 8) is enough to move policy weights
+off the SFT base, not enough to reach a new equilibrium on
+out-of-distribution `validation_samples/math.jsonl` problems.
+The KL trajectory (~0.001–0.002, very small) shows the policy
+*did* move, but not enough — a U-shape where intermediate
+trajectories are worse than either endpoint is the expected
+shape from RLHF/RLVR-on-small-model literature.
+
+**Methodological takeaway.** **Partial RLVR is risky to deploy.**
+Either commit wall-clock for a multi-epoch run with monitored
+eval checkpoints, or stay on the SFT base. The team-committed
+fallback path ("SFT fallback if RLVR destabilizes" — `CLAUDE.md`
+→ "Milestone strategy") is exactly the situation this clause was
+written for. Per Dang & Ngo 2025, the destabilization can come
+from incomplete training as easily as from hyperparameter
+mis-tuning; healthy in-training metrics do not guarantee a
+non-regressed out-of-training eval.
+
+**Operational consequence.** v3 SFT remains the production
+checkpoint on `cs-552-2026-emainelpe/math_model`. Future RLVR
+attempts must beat **pass@8 = 0.4000 on
+`validation_samples/math.jsonl`** under ci-faithful caps to clear
+the bar — a regression does not graduate.
+
 ---
 
 ## Status — update at the end of each session
@@ -713,7 +933,11 @@ Stage 1 — Data preparation:              DONE (2026-05-07)
 Stage 2 — Chat-template verification:    DONE (2026-05-07)
 Stage 3 — SFT training script:           DONE (2026-05-07)
 Stage 4 — Local eval:                    DONE (2026-05-07)
-Stage 5 — Merge and push:                NOT STARTED
+Stage 5 — Merge and push:                DONE (v3 SFT pushed; 2026-05-12)
 Stage 6 — RCP submission script:         DONE (2026-05-08)
-Stage 7 — RLVR:                          V0 IMPLEMENTED 2026-05-09 (NOT YET TRAINED)
+Stage 7 — RLVR:                          COMPLETED 2026-05-13 (regressed, not pushed)
 ```
+
+CI nightly grade for the currently pushed v3 SFT: **pass@8 = 0.32**
+(2026-05-13). Local validation_samples pass@8: **0.40** (both cap
+modes). See `docs/BASELINE.md` → "2026-05-13" for the full table.

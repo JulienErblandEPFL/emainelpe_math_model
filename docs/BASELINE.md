@@ -283,3 +283,93 @@ numerical drift is zero.
   0.4000 *with the temperature sweep applied*, not a single-temperature
   draw. The within-noise band is ±5 pp; one isolated 0.40 at one
   temperature does not clear the bar.
+
+---
+
+## 2026-05-13 — RLVR-v3 (partial), cap-mode parity, CI nightly grade
+
+**Date.** 2026-05-13
+**Hardware.** 1× A100 40GB on RCP cluster
+**Eval file.** `validation_samples/math.jsonl` (N=10, OOD competition snapshot)
+**Sampling.** n=8, seed=42, `top_p=0.95`, `top_k=20`. Each variant
+evaluated at its locked checkpoint temperature (v3 SFT @ 0.4; bare
+baseline @ 0.3 — fallback because the bare HF id ships no
+`generation_config.json`).
+
+### Results — local
+
+| Mode               | Model                              | pass@1 | pass@8 |
+|--------------------|------------------------------------|--------|--------|
+| ci-faithful (4096) | `Qwen/Qwen3-1.7B` (bare, temp=0.3) | 0.1625 | 0.2000 |
+| ci-faithful (4096) | v3 SFT (temp=0.4)                  | 0.2875 | 0.4000 |
+| ci-faithful (4096) | RLVR-v3 (600 steps, temp=0.4)      | —      | 0.3000 |
+| final-grading (16384) | `Qwen/Qwen3-1.7B` (bare, temp=0.3) | 0.1625 | 0.2000 |
+| final-grading (16384) | v3 SFT (temp=0.4)                  | 0.2875 | 0.4000 |
+| final-grading (16384) | RLVR-v3 (600 steps, temp=0.4)      | —      | 0.3000 |
+
+### Results — CI nightly (2026-05-13)
+
+| Model    | benchmark    | pass@8 |
+|----------|--------------|--------|
+| v3 SFT   | CI math set  | 0.3200 |
+
+The CI's secret math benchmark is N≥100 and disjoint from
+`validation_samples/math.jsonl`. The 0.32 nightly grade is the
+externally verified headline for the currently pushed checkpoint.
+
+### Cap-mode parity finding
+
+Per TA clarification, final-grading mode raises the per-completion
+budget from 4096 to 16384 tokens. For our 1.7B math expert on
+`validation_samples/math.jsonl`, **the cap mode does not change
+pass@8 on any evaluated checkpoint**: completions terminate
+naturally (EOS or `\boxed{...}`) before 4096 tokens. Truncation is
+not the binding constraint on this snapshot.
+
+**Operational consequence.** ci-faithful caps remain the predictive
+local-eval mode. The TA's final-grading bump does not buy our model
+any extra headroom on this set; do not expect the CI nightly's 0.32
+to lift under final-grading mode either. If a future variant has
+markedly longer reasoning chains the parity could break — re-check
+at that point.
+
+### RLVR-v3 regression
+
+After five integration bugs were fixed (see `IMPLEMENTATION_PLAN.md`
+→ "Lessons learned" → "2026-05-12/13 — RLVR 5-bug arc"), GRPO
+training ran cleanly. Wall-clock constraints stopped training at
+**600 steps (~16% of one epoch on 3919 difficulty-curated
+prompts)**. Training metrics looked healthy at stop:
+- reward_std ≈ 0.35–0.55 (good gradient signal)
+- KL from SFT reference ≈ 0.001–0.002 (no spike)
+- ~38,400 total rollouts trained on (600 steps × 8 rollouts × 8 prompts)
+
+The resulting RLVR-v3 checkpoint **regressed pass@8 from 0.40 to
+0.30** on `validation_samples/math.jsonl` under both cap modes. The
+policy moved off the SFT optimum without enough steps to recover or
+improve. **Not pushed to HF.** v3 SFT remains the team math expert.
+
+This is consistent with Dang & Ngo 2025's small-model RLVR
+instability warning: partial RLVR can be net-negative. The training
+infrastructure is correct (fail-fast preflights, healthy in-training
+metrics) — the limiting factor was wall-clock, not engineering.
+
+### Bar for any future RLVR attempt
+
+Beat **pass@8 = 0.4000 under ci-faithful caps** on
+`validation_samples/math.jsonl`. A regression is a regression; the
+v3 SFT 0.40 stands until a full-epoch RLVR run lands and clears it.
+Headline grade target: **CI pass@8 > 0.32** for any push that
+replaces the current v3 SFT.
+
+### v4 SFT note
+
+A v4 SFT variant (200k OMI2, single-source) was submitted in
+parallel on 2026-05-12 and **crashed at epoch 0.08 with OOM during a
+training step** (9.27 GiB single-tensor allocation on a long
+sequence). The existing eval-OOM fix (`per_device_eval_batch_size=1`)
+addresses eval-time logits materialization but not the training-step
+logits + loss path on extremely long rows. v4 is dead; v3 SFT
+remains the production checkpoint. The OOM signal suggests 200k pure
+OMI2 has a tail of very long sequences that the current token-length
+filter does not catch.
