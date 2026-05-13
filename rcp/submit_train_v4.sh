@@ -157,10 +157,12 @@ POD_CMD+=" && cd ${REPO_DIR}"
 POD_CMD+=" && pip install -r requirements.txt"
 # Liger Kernel sanity check: fail fast if the install ever breaks (the
 # primary OOM mitigation depends on this import succeeding before
-# train_sft.py launches). If this trips, requirements.txt or the wheel
-# repository drifted and the run would have died ~30 min later at the
-# train_sft.py preflight anyway — better to surface it here.
-POD_CMD+=" && python -c 'import liger_kernel; print(\"liger_kernel\", liger_kernel.__version__)'"
+# train_sft.py launches). Also imports apply_liger_kernel_to_qwen3 — the
+# model-specific patch we actually need — so a wheel that loses Qwen3
+# support trips here, not 30 min later at the train_sft.py preflight.
+# liger-kernel 0.8.0 does NOT expose a __version__ attribute, so we
+# check importability only.
+POD_CMD+=" && python -c 'import liger_kernel; from liger_kernel.transformers import apply_liger_kernel_to_qwen3; print(\"liger_kernel imported OK (Qwen3 patch available)\")'"
 if [[ -z "${SKIP_PREP:-}" ]]; then
   POD_CMD+=" && python data/prepare_sft.py ${PREP_FLAGS}"
 fi
