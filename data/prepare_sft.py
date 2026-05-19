@@ -15,6 +15,15 @@ Algebra (pass@1=0.296), Precalculus (pass@1=0.339), and Level 5
 (pass@1=0.213) without losing v3's OMI2-driven base. See CLAUDE.md →
 "v4 training plan" for the full rationale.
 
+v5 (2026-05-14): ``--source openmathinstruct`` with ``--train-size 100000``
+produced a 100,000-row pure-OMI2 dataset (``data_out_v5_omi2_100k``) for
+the OMI2-scaling experiment. No dedup / oversampling artifacts: the raw
+OMI2 split has ~999k unique-problem rows so ``per_question_cap=4`` does
+not bind at this scale, and ``max_formatted_tokens=2900`` drops zero
+rows (OMI2 CoTs are compact). Tests whether v3 is OMI2-saturated at 50k
+or whether scaling lifts performance — see CLAUDE.md → "2026-05-14
+Daily Log" for the outcome.
+
 Dedup semantics (2026-05-13 — final policy). v4-mix does **not** dedup
 across sources. The first pass of the design called for cross-source
 dedup at the final concat, but operational measurement showed it

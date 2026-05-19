@@ -463,6 +463,381 @@ wall-clock.
 
 ---
 
+## 2026-05-14 Daily Log
+
+### v4 SFT experiments — NEGATIVE RESULT
+
+Two v4 variants trained successfully on the v4-mix dataset (67,135 train
+rows, no cross-source dedup, per_question_cap=4 binding for IntAlg /
+Precalc oversampling):
+
+- **v4-fresh** (`cs552-erbland-g65-v4-fresh-20260513-213048`, W&B
+  `k93kbsns`): fresh init from Qwen3-1.7B base, lr=1e-4, final loss
+  ~0.394, MATH-500 pass@1 = 0.413
+- **v4-resume** (`cs552-erbland-g65-v4-resume-20260513-213244`, W&B
+  `zd5x6syj`): initialized from v3's adapter, lr=5e-5, final loss
+  ~0.413, MATH-500 pass@1 = 0.431
+
+Both regressed from v3 (MATH-500 pass@1 = 0.514) on every subject and
+level. Including the targeted subjects: IntAlg 0.296 → 0.211 / 0.216
+(−8 pp), Precalc 0.339 → 0.174 / 0.196 (−14 to −16 pp). The
+5-temperature validation sweep on v4-resume showed pass@8 = 0.40 only
+at temp=0.4 (single-temp), vs v3 hitting 0.40 at temps 0.4 AND 0.6
+(multi-temp). Conclusion: noise-level mirage on the N=10 validation
+set; real regression on MATH-500 (N=500).
+
+**Lesson.** At 1.7B parameters, targeted data augmentation via the v4
+mix did not lift performance. Within-bucket oversampling for IntAlg
+(1295 unique problems × 4× cap) and Precalc (746 × 4× cap) wasn't
+enough signal to move pass@1, while the addition of MATH-train +
+NuminaMath diluted OMI2's contribution. Hypothesis confirmed: the
+model is capacity-bound, not coverage-bound, at this scale. The v4
+diagnostic-driven multipliers were the right call given the v3
+diagnostic gaps, but the gap *is the gap a 1.7B parameter count
+imposes*, not one that more aligned data closes.
+
+Personal HF backups (created 2026-05-14):
+- `JulienE220/math-adapter-sft-v4-resume-r32-20260514` (pending push)
+- v4-fresh not backed up — underperformed v4-resume
+
+Team HF repo state at end of day: **v4-resume pushed knowingly for one
+CI cycle** to observe the nightly grade. Plan: re-push v3 tomorrow
+morning before the next CI window if v4-resume's grade comes in below
+v3's ~0.32.
+
+### Liger Kernel deployed — OOM structural fix (verified on cluster)
+
+Three OOM crashes prior to fix (v4-200k, v4-fresh first attempt,
+v4-resume first attempt) all hit `torch.OutOfMemoryError` at
+`outputs.logits[..., :-1, :].contiguous()` — the materialized
+B × T × 151,643 × 4 bytes logits tensor exceeded A100-40GB headroom on
+near-max-length batches.
+
+Fix: enabled `use_liger_kernel=True` in both SFTConfig and GRPOConfig
+via `--use-liger-kernel` BooleanOptionalAction (default True). Liger
+Kernel's fused cross-entropy never materializes the full logits
+tensor — loss is computed chunk-by-chunk on hidden states directly.
+Plus added `PYTORCH_ALLOC_CONF=expandable_segments:True` env var to
+all three submit scripts as secondary fragmentation mitigation. Plus
+added `liger-kernel>=0.8.0` to `requirements.txt`.
+
+Verified on cluster (2026-05-14): `liger-kernel 0.8.0` installs
+cleanly with TRL 0.19.1 + transformers 5.7.0 + torch 2.10.0+cu128.
+`apply_liger_kernel_to_qwen3` patch exists. **Note: `liger_kernel`
+0.8.0 does NOT expose `__version__`** — any future sanity check
+should not depend on that attribute. All 8 new CLI plumbing tests
+pass. Total test count after fix: 334 passed + 1 skipped.
+
+A bash quoting bug in the submit scripts' Liger Kernel sanity check
+caused 3 false-start submissions ("syntax error near unexpected
+token `('"). Root cause: the bash escape `\"` was correctly emitted
+by the submit script, but `runai workload submit` stripped escape
+characters when serializing the pod command. The `bash -n` test on
+the assembled POD_CMD only caught the LOCAL form, not what arrived
+at the pod. Final fix: removed the cosmetic sanity-check line
+entirely. The implicit chain is structurally stronger — pip install
+failure or TRL trainer construction will raise a clean `ImportError`
+if Liger Kernel isn't available. Kept the generic `bash -n` test as
+regression guard for future POD_CMD changes.
+
+### RLVR rescue — currently running (launched 2026-05-14 15:25)
+
+Job: `cs552-erbland-g65-rescue-20260514-152540`. W&B run name pending.
+
+**Config**:
+- Adapter init: v3
+  (`/scratch/Julien/runs/cs552-erbland-g65-v3-omi2-fix2-20260511-152150/final`)
+- Prompt set: `/scratch/Julien/data_out_v3/rlvr_prompts.jsonl` (3936
+  problems, signal-band-filtered to [0.250, 0.750] solve_rate per
+  v3's scoring — uses k=8 rollouts so solve_rate is quantized to
+  {0.250, 0.375, 0.500, 0.625, 0.750})
+- SFT_MODEL (for preflights): `/scratch/Julien/merged/math_model_v3`
+- `USE_VLLM=1` (asynchronous vLLM rollouts)
+- `MASK_TRUNCATED=1` (don't penalize rollouts hitting `max_new_tokens`)
+- `LOG_COMPLETIONS=1` (visibility for debugging via W&B)
+- `LEARNING_RATE=3e-6`, `KL_COEF=0.04` (Tülu 3 default),
+  `ROLLOUT_TEMP=0.8`, `MAX_PROMPTS=3936`
+- `LOSS_TYPE=dapo` (default — was suspected in retry3, but the
+  signal-band filter resolves the upstream cause)
+- `HARD_KILL_ON_WEAK_SIGNAL=unset` — let the run proceed even if
+  signal weakens, to observe the full trajectory
+- Liger Kernel enabled (default True after today's fix)
+
+**Early observations** (steps 1-30): `frac_reward_zero_std` mostly 0
+(sporadically 1 on prompts that have converged to always-pass /
+always-fail individually). KL tiny (~0.0003-0.002). Rewards varying
+healthily with std ~0.35-0.52. Step pace ~10-20 s/step average →
+projected ~15-17h total wall-clock. ETA: 2026-05-15 08:00-10:00.
+
+**Critical insight.** The retry3 failure mode was *global* signal
+starvation (`frac_reward_zero_std=1.0` constant). This run shows
+*sporadic* per-prompt saturation (some prompts always-pass or
+always-fail) but global signal still flows. The signal-band-filtered
+prompt set is doing its job — exactly the rescue lever P1 from the
+2026-05-13 plan.
+
+### v5 OMI2 100k SFT — currently running (launched 2026-05-14 16:22)
+
+Job: `cs552-erbland-g65-v4-fresh-20260514-162214`. The job-name
+convention is cosmetic (re-used the v4-fresh submit script with
+`SKIP_PREP=1` + override `DATA_OUT_DIR`); the *data* is v5 OMI2 100k,
+NOT v4-mix.
+
+**Hypothesis.** At 1.7B scale, scaling pure OMI2 from 50k (v3) to
+100k might lift performance. Tests whether v3 is OMI2-saturated at
+50k. Single variable changed: dataset size. If v5 > v3, scaling
+works at this parameter count. If v5 ≈ v3, the parameter-bound
+hypothesis from v4 holds.
+
+**Dataset**: `/scratch/Julien/data_out_v5_omi2_100k/` — 100,000 train
++ 500 eval. Source: `nvidia/OpenMathInstruct-2` split=train_1M (same
+as v3). Filters: per_question_cap=4 (no binding at this scale, all
+999,893 raw rows have unique problems), max_formatted_tokens=2900
+(0 dropped — OMI2 CoTs are compact). Dataset is byte-clean: no
+oversampling, no cross-source-dedup tension.
+
+**Config.** Identical to v4-fresh runtime (Liger Kernel on, lr=1e-4,
+fresh init from base Qwen3-1.7B, 2 epochs).
+
+**Early observations** (steps 1-2): loss 0.974 → 0.961,
+mean_token_accuracy 0.807 → 0.808. Starting loss is *lower* than
+v4-fresh's 1.103 — OMI2's well-curated 405B-teacher CoTs are closer
+to Qwen3-1.7B's natural distribution than the v4-mix was. Token
+accuracy already 2 pp higher than v4-fresh at the same step. Step
+pace ~4 s/step → projected ~7-8h wall-clock. ETA: 2026-05-14
+23:30 - 2026-05-15 01:00.
+
+### Parallel run note
+
+Both RLVR and v5 SFT are running in parallel on 2 GPUs (the cluster
+gave us a second slot). Each is preemptible. **If preemption hits,
+RLVR is the higher-value job to preserve** — more compute invested,
+the signal-band prompt set is non-trivial to re-generate. v5 SFT is
+cheap to relaunch.
+
+### Pending tasks for tomorrow (2026-05-15 ~09:00)
+
+1. Check CI nightly grade on v4-resume (deployed in team HF overnight
+   by design).
+2. Re-push v3 to team HF if v4-resume CI grade is worse than v3's
+   ~0.32 (likely — expected v4-resume CI ~0.25-0.28).
+3. Push v4-resume backup to personal HF:
+   `JulienE220/math-adapter-sft-v4-resume-r32-20260514`.
+4. Check RLVR completion and the final reward trajectory in W&B.
+5. Check v5 OMI2 100k completion and final eval loss.
+6. Merge each completed adapter (`merge_and_push.py` dry-run; no push).
+7. Run the 5-temperature sweep on each via `eval_local.py`.
+8. Run `diagnose_v3.py --target all --model <merged>` against each
+   for per-subject comparison vs v3.
+9. Decide which adapter (RLVR-rescue, v5, or v3) to push to team HF
+   as the math expert for the Phase 3 merge.
+10. Update CLAUDE.md with results from this comparison.
+
+---
+
+## 2026-05-15 Daily Log
+
+Four experiments closed out today: two overnight runs from 2026-05-14
+(v5 OMI2 100k SFT, RLVR rescue) finished in the early morning, plus a
+fresh v6 OMI2 200k SFT run that ran through the day and finished early
+on 2026-05-16. v5 was diagnosed, smoke-tested, and pushed to team HF
+at 13:05 UTC; RLVR rescue suffered end-of-run policy collapse and the
+recoverable checkpoint-650 turned out to be v3-equivalent noise; v6
+landed a small-but-real MATH-500 lift over v5 but failed the
+5-temperature sweep on validation.
+
+### v5 OMI2 100k SFT — POSITIVE RESULT (deployed to team HF)
+
+- Run name: `cs552-erbland-g65-v4-fresh-20260514-162214` (cosmetic v4
+  naming; data is v5 OMI2 100k).
+- Dataset: `/scratch/Julien/data_out_v5_omi2_100k` (100k train + 500
+  eval, pure OMI2 from `train_1M` split).
+- Config: fresh init from `Qwen3-1.7B` base, lr=1e-4, 2 epochs, Liger
+  Kernel ON.
+- Final training loss ~0.40.
+- Personal HF backup: `JulienE220/math-adapter-sft-v5-omi2-100k-r32-20260515`.
+- Team HF deployment: pushed 2026-05-15 13:05 UTC, replacing v4-resume
+  (which had been knowingly deployed for one CI cycle to observe the
+  nightly grade).
+
+**Diagnostic results vs v3 baseline.**
+
+| Surface | v3 | v5 | Δ |
+|---|---|---|---|
+| Validation pass@8 (temp=0.4) | 0.400 | 0.500 | +10pp |
+| In-distribution pass@1 (N=500) | 0.408 | 0.456 | +4.8pp |
+| In-distribution pass@4 (N=500) | 0.628 | 0.686 | +5.8pp |
+| MATH-500 pass@1 | 0.514 | 0.516 | +0.2pp (tied) |
+| MATH-500 pass@4 | 0.686 | 0.672 | −1.4pp |
+
+Per-subject highlights (MATH-500 pass@1): Algebra 0.700→0.732,
+Counting 0.480→0.520, Prealgebra 0.668→0.683, Level 1 0.797→0.855.
+Slight regressions on hard subjects: IntAlg −2.8pp, Precalc −4.0pp,
+Level 5 −1.9pp.
+
+**5-temperature sweep on validation.** pass@8 = 0.500 only at
+temp=0.4 (single-temp peak), 0.400 at temp=0.5, 0.300 at temps
+0.6/0.7/0.8. The 0.500 is single-temp like v4-resume's noise mirage,
+but the in-distribution N=500 lift (+4.8pp pass@1, +5.8pp pass@4) is
+robust and the MATH-500 pass@1 is tied (no regression). Net: pushed
+to team HF as the math expert.
+
+**Verdict.** v5 lifts in-distribution robustly, validation peak only
+at one temperature, MATH-500 tied. Better than v3 in mid-difficulty
+and easy-difficulty problems, slightly worse on the hardest subjects.
+Pushed to team HF as the math expert pending nightly CI signal.
+
+### RLVR rescue — POLICY COLLAPSE + RECOVERED CHECKPOINT-650
+
+- Run name: `cs552-erbland-g65-rescue-20260514-152540`.
+- Config: SFT_MODEL=v3, USE_VLLM=1, MASK_TRUNCATED=1,
+  LOG_COMPLETIONS=1, LR=3e-6, KL_COEF=0.04, ROLLOUT_TEMP=0.8,
+  MAX_PROMPTS=3936, LOSS_TYPE=dapo, Liger Kernel ON.
+
+**Critical failure mode discovered post-training.**
+- Training completed at 100% epoch with all monitoring signals
+  healthy: `frac_reward_zero_std` mostly 0, KL tiny, reward varying
+  with std ~0.35-0.52.
+- BUT: the final adapter at `/final/` produces broken output —
+  `"useruseruseruser..."` 1000+ token repetition on a "What is 2+2?"
+  smoke test.
+- Policy collapse occurred near the end of training despite healthy
+  in-flight monitoring; importance sampling ratios were unstable
+  across the run.
+- The script's post-training smoke check (`smoke_inference_p1`)
+  caught the collapse: "P1 preflight FAILED: smoke output missing
+  `\boxed{}`."
+
+**Recovered checkpoint-650.**
+- Saved `checkpoint-650` at epoch=0.1651 (16.5% epoch,
+  global_step=650), `checkpoint-700` at epoch=0.1778.
+- `checkpoint-700` had reward crash from 0.55 → 0.044 between step
+  698 → step 699 (collapse moment located).
+- `checkpoint-650` had healthy reward 0.425-0.675, KL 0.0008-0.0014,
+  frac_zero_std=0 — pre-collapse.
+- Smoke-tested checkpoint-650: produces clean
+  `<think>2+2=4</think>\boxed{4}` output.
+- Merged at `/scratch/Julien/merged/math_model_rlvr_ckpt650`.
+
+**Diagnostic on RLVR-ckpt650 vs v3.**
+
+| Surface | v3 | RLVR-ckpt650 | Δ |
+|---|---|---|---|
+| MATH-500 pass@1 | 0.514 | 0.519 | within noise |
+| In-distribution pass@1 | 0.408 | 0.431 | small lift, possibly noise |
+| Validation pass@8 | 0.400 | 0.300 | N=10 noise |
+
+Per-subject: noise-level shifts (≤2pp) in both directions, no
+consistent pattern. **Verdict**: essentially v3 with noise. 16.5%
+epoch of GRPO refinement → no measurable lift.
+
+**Lesson.** RLVR at 1.7B has a narrow stability window: 16.5% epoch
+= noise; 100% epoch = policy collapse. The signal-band-filtered
+prompt set fixed the retry3 starvation (rescue P1 worked), but the
+combination of `LOSS_TYPE=dapo` (still half-configured —
+`epsilon_high=null`), unbounded training duration, and 1.7B-scale
+instability produced a different failure mode (late-run policy
+collapse instead of gradient starvation). Publishable negative result
+for the report.
+
+### v6 OMI2 200k SFT — positive but mixed signal
+
+- Run name: `cs552-erbland-g65-v4-fresh-20260515-152430` (cosmetic v4
+  naming; data is v6 OMI2 200k).
+- Dataset: `/scratch/Julien/data_out_v6_omi2_200k` (200k train + 500
+  eval, pure OMI2 from `train_1M` split).
+- Config: fresh init from `Qwen3-1.7B` base, lr=1e-4, 2 epochs, Liger
+  Kernel ON.
+- Final training loss: **0.329** (lower than v5's ~0.40; final
+  `mean_token_accuracy` 0.889 vs v5's ~0.87).
+- Wall-clock: ~17h (launched 2026-05-15 15:24, finished early morning
+  2026-05-16).
+
+**Diagnostic results vs v5.**
+
+| Surface | v5 | v6 | Δ |
+|---|---|---|---|
+| Validation pass@8 (temp=0.4) | 0.500 | 0.300 | −20pp (N=10 noise but consistent with sweep) |
+| In-distribution pass@1 (N=500) | 0.456 | 0.456 | tied |
+| In-distribution pass@4 (N=500) | 0.686 | 0.678 | −0.8pp |
+| MATH-500 pass@1 | 0.516 | 0.525 | +0.9pp (real at N=500) |
+| MATH-500 pass@4 | 0.672 | 0.682 | +1.0pp |
+
+Per-subject (MATH-500 pass@1): Algebra +2.6pp, IntAlg +2.3pp,
+Precalc +3.1pp (hard subjects partially recovered), but Counting
+−4.6pp, Prealgebra −1.2pp, Level 1 −1.8pp (easy subjects slightly
+regressed). Level 5 jumped +4.1pp — v6 lifts hard problems v5 was
+flat on.
+
+**5-temperature sweep on validation.** All temps flat at pass@8 = 0.300:
+
+| temp | pass@8 |
+|---|---|
+| 0.3 | 0.300 |
+| 0.4 | 0.300 |
+| 0.5 | 0.300 |
+| 0.6 | 0.300 |
+| 0.7 | 0.300 |
+
+v6 hits the "always-solvable" core of `validation_samples/math.jsonl`
+but doesn't reach v5's temp-0.4 peak of 0.500. Likely explanation:
+v5's 0.500 at temp=0.4 was getting lucky on one specific problem
+that v6's distribution doesn't favor. `validation_samples` is N=10,
+dominated by noise at this resolution.
+
+**Verdict on v6.** Small but real lift on MATH-500 (+0.9pp pass@1,
++1.0pp pass@4), redistribution of per-subject performance (hard
+subjects up, easy subjects slightly down). Validation regression is
+likely N=10 noise. **NOT yet pushed to team HF** — waiting for v5's
+CI grade to inform the decision.
+
+### Scaling progression at 1.7B (key finding)
+
+| Variant | Data | MATH-500 pass@1 | Δ vs v3 |
+|---|---|---|---|
+| v3 | 50k OMI2 | 0.514 | — |
+| v5 | 100k OMI2 | 0.516 | +0.2pp (tied) |
+| v6 | 200k OMI2 | 0.525 | +1.1pp |
+
+Cumulative +1.1pp pass@1 for 4× more data. Per-subject pattern is
+non-uniform: 100k lifts easy/mid, 200k partially recovers hard
+subjects. Consistent with a **soft capacity bound** at 1.7B that more
+data partially overcomes — not hard saturation. Open question
+whether v7 at 400k or 500k would push further or hit a true ceiling.
+
+### Diagnostics archived
+
+- `/scratch/Julien/diagnostics/v5_eval/`
+- `/scratch/Julien/diagnostics/rlvr_ckpt650_eval/`
+- `/scratch/Julien/diagnostics/v6_eval/`
+- `/scratch/Julien/v5_temp_sweep/`
+- `/scratch/Julien/v6_temp_sweep/`
+
+### Deployment state end of 2026-05-15
+
+- **Team HF (`cs-552-2026-emainelpe/math_model`)**: v5 OMI2 100k
+  (pushed 13:05 UTC, awaiting CI grade).
+- **Personal HF backups (Julien)**: v1, v2, v3, v5 done. v4-resume,
+  v4-fresh, v6 backup pending push.
+- **v6 merged** at `/scratch/Julien/merged/math_model_v6_omi2_200k`,
+  NOT pushed (pending v5 CI signal).
+
+### Pending tasks for 2026-05-16
+
+1. Find v5's CI nightly grade (graded overnight 2026-05-15 → 16).
+2. Decide based on v5 CI grade:
+   - v5 ≥ v3 CI → keep v5, consider pushing v6 as upgrade.
+   - v5 ≈ v3 CI → keep v5, do NOT push v6.
+   - v5 < v3 CI → roll back to v3 immediately.
+3. Push v6 to personal HF backup:
+   `JulienE220/math-adapter-sft-v6-omi2-200k-r32-20260516`.
+4. Push v4-resume + v4-fresh to personal HF backups (deferred from
+   yesterday).
+5. Begin Phase 3 group merge prep (4 days to the 2026-05-19
+   milestone).
+
+---
+
 ## Locked shared files
 
 `configs/lora.yaml` and `chat_template/chat_template.jinja` are copied from

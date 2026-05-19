@@ -624,49 +624,94 @@ options only if the main path lands ahead of schedule.
 
 ---
 
-## Project state as of 2026-05-13
+## Project state as of 2026-05-15
 
-**Final math expert.** v3 SFT (50k OMI2, r=32, α=64, temp=0.4).
-Pushed to `cs-552-2026-emainelpe/math_model`. RLVR-v3 trained but
-regressed and not pushed.
+**Current math expert on team HF.** **v5 SFT** (100k pure OMI2,
+r=32, α=64, temp=0.4). Pushed to `cs-552-2026-emainelpe/math_model`
+on 2026-05-15 13:05 UTC, replacing v4-resume (which had been
+knowingly deployed for one CI cycle to observe its nightly grade).
+v6 SFT (200k pure OMI2) is merged at
+`/scratch/Julien/merged/math_model_v6_omi2_200k` but **NOT pushed**
+— held in reserve pending v5's first CI grade. RLVR rescue
+(2026-05-14/15) suffered late-run policy collapse; the recovered
+intermediate `checkpoint-650` was diagnosed at v3-level noise and is
+not a deployment candidate.
 
-**Measured numbers.**
+**Measured numbers (local).**
 
-| Surface              | pass@8 | Notes |
-|----------------------|--------|-------|
-| local `validation_samples/math.jsonl`, ci-faithful (4096) | 0.40 | v3 SFT @ temp=0.4 |
-| local `validation_samples/math.jsonl`, final-grading (16384) | 0.40 | identical to ci-faithful — cap not binding on N=10 |
-| CI nightly (2026-05-13), secret math benchmark | 0.32 | currently pushed v3 SFT |
+| Surface | v3 | v5 | v6 |
+|---|---|---|---|
+| `validation_samples/math.jsonl` pass@8 @ temp=0.4 | 0.400 | 0.500 | 0.300 |
+| In-distribution pass@1 (N=500) | 0.408 | 0.456 | 0.456 |
+| In-distribution pass@4 (N=500) | 0.628 | 0.686 | 0.678 |
+| MATH-500 pass@1 (N=500) | 0.514 | 0.516 | 0.525 |
+| MATH-500 pass@4 (N=500) | 0.686 | 0.672 | 0.682 |
+| Validation 5-temp sweep peak | 0.40 @ T=0.4,0.6 | 0.50 @ T=0.4 only | 0.30 flat |
 
-The 8 pp local→CI gap is consistent with N=10 sampling variance
-(±15 pp standard error on N=10) plus distribution shift between
-`validation_samples/math.jsonl` and the CI's larger secret set. The
-evaluator is byte-identical across local and CI (`evaluate/` package
-vendored from OpenCompass), so the gap is purely sampling + dataset,
-not measurement.
+**Scaling progression at 1.7B** (pure OMI2 SFT, MATH-500 pass@1):
+50k → 100k → 200k: 0.514 → 0.516 → 0.525. Cumulative +1.1pp for
+4× more data. Soft capacity bound — diminishing returns but
+monotonic. Per-subject is **non-uniform redistribution**: v5 lifts
+easy + mid; v6 partially recovers hard subjects (IntAlg, Precalc,
+Level 5) at the cost of slight regressions on easy subjects.
 
-**Status.** Ready for Phase 3 (team merge).
+**CI nightly grade.** Last known v3 nightly = 0.32 (2026-05-13). v5
+nightly grade pending overnight 2026-05-15 → 16. Decision rule for
+2026-05-16 morning:
+- v5 ≥ v3 CI → keep v5; consider pushing v6 as upgrade.
+- v5 ≈ v3 CI → keep v5; do not push v6.
+- v5 < v3 CI → roll back to v3.
+
+**Negative results documented (for the report).**
+- v1 (DART-only 50k): pass@8 = 0.30 (no lift over v2/v3).
+- v4-fresh / v4-resume (diagnostic-driven v4-mix): regressed
+  MATH-500 vs v3 across every subject and level; data-targeted
+  augmentation didn't help at 1.7B.
+- RLVR retry3 (2026-05-13): gradient starvation
+  (`frac_reward_zero_std≈1.0`), pass@8 regression 0.40 → 0.30.
+- RLVR rescue (2026-05-14/15): healthy gradient signal throughout
+  but late-run **policy collapse**; recovered `checkpoint-650` at
+  v3-level noise. Two distinct failure regimes on small-model RLVR
+  observed.
+
+**Status.** v5 deployed on team HF; v6 held in reserve. Ready for
+Phase 3 (team merge starting ~2026-05-19) pending CI signal.
 
 ---
 
 ## Remaining work
 
+- **v5 CI nightly grade verification.** Pending overnight 2026-05-15
+  → 16. Decision rule documented in "Project state as of 2026-05-15"
+  above. Roll-back path: re-push v3 if CI regresses.
+- **Optional v6 push.** If v5 CI ≥ v3 CI, v6 is a candidate upgrade
+  (MATH-500 +0.9pp at N=500, partially recovers hard-subject gaps
+  v5 left flagged). If v5 CI ≈ v3 or worse, hold v6 in reserve.
+- **Optional v7 scaling experiment.** v3 → v5 → v6 monotonic lift
+  suggests 400k or 500k may still produce gains, though
+  diminishing-returns. Not in critical path for 2026-06-07 grading.
+  Worth running if cluster wall-clock allows; pure OMI2, same
+  recipe as v5/v6.
 - **Self-distillation (optional, ~12 h GPU, +1–3 pp expected lift).**
-  Generate solutions from v3 SFT at temp=0.4, filter for
-  correctness via `evaluate.is_equiv` against gold answers, re-train
-  the LoRA adapter on this self-curated set. Recovers the
-  consistency v3 lost on hard problems without the RLVR
-  destabilization risk. Not yet started.
+  Generate solutions from v5 at temp=0.4, filter for correctness via
+  `evaluate.is_equiv` against gold answers, re-train the LoRA
+  adapter on this self-curated set. Recovers consistency on hard
+  problems without the RLVR destabilization risk. Not yet started.
+  Lower priority now that v5/v6 SFT scaling produced real lifts.
 - **Report drafting.** Methods + results sections, target this
   week. Include the 5-bug RLVR arc as a debugging case study; the
-  cap-mode parity finding as a measurement methodology note; the
-  v1/v2/v3 temperature sweep as the SFT selection methodology.
-- **Team merge support (Phase 3).** Starts ~2026-05-19. v3 SFT
-  adapter at `cs-552-2026-emainelpe/math_model` is the math
-  contribution to the DARE + AdaMerging merge.
+  two RLVR failure regimes (retry3 starvation vs rescue late-run
+  collapse) as a small-model RLVR study; the v1→v2→v3→v5→v6
+  temperature sweep + MATH-500 scaling as the SFT selection +
+  scaling methodology.
+- **Team merge support (Phase 3).** Starts ~2026-05-19. v5 SFT
+  adapter at `cs-552-2026-emainelpe/math_model` is the current
+  math contribution to the DARE + AdaMerging merge; may upgrade to
+  v6 pending CI signal.
 - **Final grading prep.** Deadline 2026-06-07. Decision point at
-  ~2026-05-30: if self-distillation lands a non-noise lift, push
-  the new checkpoint; otherwise v3 SFT ships as-is. Per `CLAUDE.md`
+  ~2026-05-30: pick the best-performing checkpoint among
+  {v3, v5, v6, v7-if-trained} based on multi-nightly CI signal.
+  Per `CLAUDE.md`
   → "Milestone strategy", SFT fallback is the documented
   contingency.
 
