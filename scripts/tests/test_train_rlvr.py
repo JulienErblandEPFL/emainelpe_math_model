@@ -80,6 +80,37 @@ def test_parse_args_dry_run():
     assert args.dry_run is True
 
 
+def test_parse_args_length_bonus_defaults_off():
+    """The two new length-shaping flags must default to OFF (0.0) and 1024.
+
+    Backward-compat contract: an existing invocation that does NOT pass
+    --length-bonus-weight has the exact same training behavior as before
+    the flag existed. main() will set reward_fn.LENGTH_BONUS_WEIGHT=0.0
+    from this default, which short-circuits the length term inside
+    reward_fn.compute_reward.
+    """
+    args = _parse_args(["--output-dir", "/tmp/x"])
+    assert args.length_bonus_weight == 0.0
+    assert args.target_length_tokens == 1024
+
+
+def test_parse_args_length_bonus_custom_values():
+    """When passed, the two flags parse as float / int respectively.
+
+    Catches regressions like accidentally typing ``type=int`` on
+    --length-bonus-weight (0.1 would silently become 0).
+    """
+    args = _parse_args([
+        "--output-dir", "/tmp/x",
+        "--length-bonus-weight", "0.1",
+        "--target-length-tokens", "512",
+    ])
+    assert args.length_bonus_weight == 0.1
+    assert args.target_length_tokens == 512
+    assert isinstance(args.length_bonus_weight, float)
+    assert isinstance(args.target_length_tokens, int)
+
+
 # =============================================================================
 # load_prompt_set_jsonl — schema enforcement is strict at this layer
 # (curation already cleaned input; anything reaching here is expected clean).

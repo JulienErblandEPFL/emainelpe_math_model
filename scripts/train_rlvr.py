@@ -395,6 +395,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--learning-rate", type=float, default=3e-6)
     p.add_argument("--kl-coef", type=float, default=0.04,
                    help="GRPO beta — KL coefficient. Tülu 3 default 0.04.")
+    p.add_argument(
+        "--length-bonus-weight", type=float, default=0.0,
+        help="Weight for the conciseness reward (rewards shorter CORRECT "
+             "completions). Default 0.0 (OFF) = legacy reward = "
+             "1.0*correct + 0.05*has_box. Try 0.1 to gently favor shorter "
+             "correct solutions; correctness still dominates.",
+    )
+    p.add_argument(
+        "--target-length-tokens", type=int, default=1024,
+        help="Token length at which the conciseness bonus is 0.5 (linear "
+             "decay 1.0->0.5->0.0 at 0/TARGET/2*TARGET tokens). Only used "
+             "when --length-bonus-weight > 0.",
+    )
     p.add_argument("--rollout-temp", type=float, default=0.8,
                    help="Rollout sampling temperature; separate from the "
                         "eval-time temp in generation_config.json.")
@@ -769,6 +782,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     _setup_logging(args.log_level)
 
+    # Wire the optional conciseness-shaping knobs into the reward module
+    # BEFORE the reward callback is defined or P2's preflight runs. With the
+    # defaults (--length-bonus-weight=0.0), this is a no-op: compute_reward
+    # short-circuits the length term and behavior is byte-identical to the
+    # pre-flag invocation.
+    from scripts import reward_fn
+    reward_fn.LENGTH_BONUS_WEIGHT = args.length_bonus_weight
+    reward_fn.TARGET_LENGTH_TOKENS = args.target_length_tokens
+    logger.info(
+        "reward config: correctness=1.0, format=0.05, "
+        "length_bonus_weight=%.3f, target_length_tokens=%d",
+        args.length_bonus_weight, args.target_length_tokens,
+    )
+
     # Locked configs first — pure-Python so any drift surfaces immediately.
     lora_yaml = load_lora_yaml(args.lora_yaml)
     chat_template = load_chat_template(args.chat_template)
@@ -942,9 +969,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # TRL reward callback signature: (completions, **kwargs) -> list[float].
     # The dataset's extra columns arrive as parallel lists; we destructure
-    # 'answer' and call the per-row reward.
-    from scripts.reward_fn import compute_reward
-
+    # 'answer' and call the per-row reward. Module-qualified call so the
+    # conciseness shaping (set on reward_fn at the top of main()) is read
+    # at call time. Tokenizer is threaded through for length measurement;
+    # at LENGTH_BONUS_WEIGHT=0.0 the reward fn ignores it.
     def _reward_callback(completions, **kwargs):
         gold_list = kwargs.get("answer")
         if gold_list is None:
@@ -952,7 +980,10 @@ def main(argv: list[str] | None = None) -> int:
                 "Reward callback received no 'answer' column. The dataset "
                 "must have prompt+answer; check the prompt-set schema."
             )
-        return [compute_reward(c, g) for c, g in zip(completions, gold_list)]
+        return [
+            reward_fn.compute_reward(c, g, tokenizer=tokenizer)
+            for c, g in zip(completions, gold_list)
+        ]
 
     trainer = GRPOTrainer(
         model=peft_model,
