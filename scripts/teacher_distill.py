@@ -68,8 +68,11 @@ from scripts.teacher_smoke import (
 
 logger = logging.getLogger("teacher_distill")
 
-# Defaults aligned with teacher_smoke (Qwen3 thinking-mode contract),
-# except max_model_len is doubled to give long thinking traces room.
+# Defaults aligned with teacher_smoke (Qwen3 thinking-mode contract).
+# max_model_len matches the CI's 4096 cap so teacher solutions fit in
+# the student's training context budget; longer traces self-eliminate
+# via the well-formed filter (truncated traces lose </think> or
+# \boxed{}) or the correctness filter.
 DEFAULT_TEACHER = "Qwen/Qwen3-32B-AWQ"
 DEFAULT_N = 2
 DEFAULT_MIN_CORRECT = 1
@@ -79,7 +82,7 @@ DEFAULT_TOP_K = 20
 DEFAULT_PRESENCE_PENALTY = 1.5
 DEFAULT_MIN_P = 0.0
 DEFAULT_MAX_TOKENS = 4096
-DEFAULT_MAX_MODEL_LEN = 8192
+DEFAULT_MAX_MODEL_LEN = 4096
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
 DEFAULT_QUANTIZATION = "awq"
 DEFAULT_SEED = 42
@@ -222,8 +225,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN,
         help=(
             f"vLLM context window. Default: {DEFAULT_MAX_MODEL_LEN} "
-            "(doubled from teacher_smoke's 4096 to give long thinking "
-            "traces room)."
+            "(matches the CI-faithful eval contract so teacher "
+            "solutions fit in the student's training context budget)."
         ),
     )
     p.add_argument(

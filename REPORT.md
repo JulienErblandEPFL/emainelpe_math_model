@@ -7,7 +7,7 @@ report; everything in here is sourced from `CLAUDE.md`,
 Do not invent numbers when finalizing — only re-frame what's recorded
 here.
 
-Last updated: 2026-05-14.
+Last updated: 2026-05-19.
 
 ---
 
@@ -42,8 +42,20 @@ Last updated: 2026-05-14.
 - **CI behaviour (binding contract).** Nightly grades on an N≥100
   secret math set. `max_model_len=4096` (combined prompt + completion),
   `n=8`, `seed=42`, 1800 s wall-clock cap. Extraction via `\boxed{}`,
-  OpenCompass `is_equiv` for equivalence. Currently graded v3 SFT at
-  **pass@8 ≈ 0.32** on the CI secret set (2026-05-13 nightly).
+  OpenCompass `is_equiv` for equivalence. **CI grade history (final
+  view at 2026-05-19):**
+
+  | Date           | Variant on team HF | CI pass@8 |
+  |----------------|--------------------|-----------|
+  | 2026-05-13 04:17 | v3 (SFT, OMI2 50k) | 0.32      |
+  | 2026-05-13 23:30 | v3 (re-grade)      | 0.35 (±2pp on N=100) |
+  | 2026-05-16 04:57 | v5 (SFT, OMI2 100k) | **0.34**  |
+  | 2026-05-19       | v6 (SFT, OMI2 200k) | **0.31** (rollback trigger) |
+  | 2026-05-20 (pending) | v5 (re-pushed after v6 rollback) | TBD |
+
+  **Final deployed math expert (end of 2026-05-19): v5 OMI2 100k SFT.**
+  v6 was pushed once for one CI cycle, regressed to 0.31, and rolled
+  back to v5 the same day.
 
 ---
 
@@ -446,7 +458,60 @@ MATH-500 pass@1 is tied (no regression).
   redistribution** (easy and mid-difficulty up, hard subjects very
   slightly down). v3 was **not** OMI2-saturated at 50k; the
   capacity-bound from v4 is **soft, not hard**. Pushed to team HF as
-  the math expert. CI nightly grade pending.
+  the math expert.
+
+- **CI nightly grade (2026-05-16): pass@8 = 0.34** on the course's
+  secret math set. Within the v3 grade band (0.32 / 0.35 across two
+  nightly draws) — i.e. **v5's local-eval lift did not transfer to a
+  measurable CI lift**, but it didn't regress either. v5 stayed
+  deployed.
+
+#### 3.7.1 Follow-up measurements (2026-05-19) — pass@16 and low-temp sweep
+
+After v6 was rolled back (see §3.9), we re-measured v5 on
+`validation_samples/math.jsonl` with two extensions:
+
+**pass@16 measurement.** 16 completions × 10 problems at temp=0.4.
+The unbiased Chen-2021 estimator reports **pass@8 from n=16 = 0.390**.
+The earlier n=8 measurement (pass@8 = 0.500) was an upper-tail
+sampling-noise artifact; n=16 gives a tighter read on the same
+quantity. v5's **true pass@8 ≈ 0.39 on this 10-problem set**, not
+0.50.
+
+Per-problem solve pattern from n=16: **4-5 of 10 problems are
+reliably solvable** (solve_rate ≈ 0.7-1.0), and **5-6 are at or
+beyond the 1.7B reasoning frontier** (solve_rate ≈ 0.0-0.3). pass@8
+on this set has a hard ceiling near 0.5 that scaling can move only
+slowly. Methodologically: **the n=8 single-temp pass@8 numbers
+reported throughout §3 should be read with ±10pp standard-error
+bars** — the pass@16 anchor is the tighter measurement.
+
+**Low-temperature sweep on v5** (extends the 5-temp sweep down to
+temps 0.20-0.40, n=8):
+
+| temp | pass@1 | pass@8 |
+|------|--------|--------|
+| 0.20 | 0.238  | 0.300  |
+| 0.25 | 0.188  | 0.300  |
+| 0.30 | 0.263  | 0.400  |
+| 0.35 | 0.288  | 0.400  |
+| 0.40 | 0.288  | 0.500  |
+
+Best (temp, metric): temp=0.40 at pass@8 = 0.500 (n=8). Confirms the
+0.5 pass@8 ceiling on this 10-problem set under n=8 sampling, and
+that temp=0.4 is the calibrated peak (already baked into the team
+HF push via `generation_config.json`). The low-temp tail (0.20-0.25)
+produces lower pass@8 than temp=0.30-0.40 — too greedy on a 10-row
+set leaves diversity unused.
+
+- **What we learned (2026-05-19 follow-up).** The "0.50 pass@8 lift
+  over v3" headline from 2026-05-15 was real at n=8 but partially a
+  sampling-noise overestimate; the **n=16 anchor places v5's true
+  pass@8 closer to 0.39** on this validation set. The CI grade
+  (0.34) is consistent with this lower true mean, not the noisier
+  0.50 reading. Lesson: **n=8 on N=10 has ~10pp standard error per
+  Chen-2021**; future SFT decisions should anchor on pass@16 (or
+  larger N) when the n=8 reading lands near a ceiling.
 
 ### 3.8 RLVR rescue — GRPO on v3 with signal-band-filtered prompts (POLICY COLLAPSE + recovered checkpoint-650)
 
@@ -611,19 +676,144 @@ that v6's distribution doesn't favor — N=10 validation set is
 sample-noise-dominated at this resolution.
 
 - **Deployment.** v6 merged at
-  `/scratch/Julien/merged/math_model_v6_omi2_200k`. **NOT pushed**
-  to team HF — waiting on v5's CI grade to decide whether the v6
-  redistribution is worth the validation regression.
+  `/scratch/Julien/merged/math_model_v6_omi2_200k`. Pushed to team
+  HF on 2026-05-19 for one CI cycle to test whether the +0.9pp
+  MATH-500 lift would transfer.
+- **CI nightly grade (2026-05-19): pass@8 = 0.31.** Regressed -3pp
+  vs v5's 0.34 — a real loss on the CI distribution despite the
+  small MATH-500 lift. The per-subject redistribution (hard subjects
+  up, easy subjects down) **net-loses on the CI's distribution** —
+  the CI grading set evidently leans easy/mid where v6 regressed,
+  not hard where v6 lifted.
+- **Decision: rolled back to v5** on team HF the same day. v6 will
+  not be re-deployed without a strong reason. Next CI cycle (pending
+  2026-05-20 nightly) grades v5 again to confirm the rollback.
 - **Diagnostics archived.** `/scratch/Julien/diagnostics/v6_eval/`,
   `/scratch/Julien/v6_temp_sweep/`.
-- **What we learned.** v3 → v5 → v6 is a clean monotonic MATH-500
-  lift (+0.2pp then +0.9pp), for a cumulative **+1.1pp over 4× more
-  data**. Per-subject the pattern is **non-uniform redistribution**:
-  v5 helps easy and mid problems; v6 partially recovers v3's hard-
-  subject gaps but at the cost of small regressions on easy
-  subjects. The diminishing-returns curve is consistent with a soft
-  capacity bound. Open question whether v7 at 400k or 500k would
-  push further or hit a true ceiling.
+- **What we learned.** v3 → v5 → v6 is a clean monotonic **MATH-500**
+  lift (+0.2pp then +0.9pp), for a cumulative +1.1pp over 4× more
+  data — but the v6 CI grade (-3pp vs v5) shows **the local lift
+  did not transfer**. Per-subject redistribution is the mechanism:
+  v5 → v6 trades easy-subject mass for hard-subject mass, and the
+  CI distribution rewards the trade that v5 made (toward easy/mid)
+  more than the one v6 made (toward hard). **Local-eval scaling
+  curves are not predictive of CI scaling at this regime.** The
+  diminishing-returns curve on MATH-500 (+0.9pp for 100k → 200k)
+  is consistent with a soft capacity bound, but the CI signal says
+  the right operating point for *this* model on *this* secret set
+  is at the v5 dataset size, not larger.
+
+### 3.10 Multi-adapter weight-space merge experiments (2026-05-19, NEGATIVE RESULT)
+
+- **Goal / hypothesis.** With three viable SFT adapters in hand (v3,
+  v5, v6) and a roughly orthogonal per-subject profile across them
+  (v3 strong overall, v5 strong on easy/mid, v6 partially recovering
+  hard), a weighted LoRA-space blend might land at a Pareto-better
+  point than any single adapter. Tests whether linear LoRA-weight
+  averaging — the same mechanism the team will use for Phase 3 group
+  merge — preserves format discipline when applied across math-only
+  adapters at the same r=32 spec.
+- **Method.** Used `scripts/merge_adapters.py` (built 2026-05-19; CPU-
+  only weight-space LoRA blending with optional DARE drop). Two
+  configurations tested:
+  - **Linear** with weights `(v3=0.2, v5=0.5, v6=0.3)`.
+  - **DARE drop=0.2** at the same weight triple (random-drop 20% of
+    delta entries per adapter before linear blend, per Yu et al.
+    DARE 2024).
+- **Smoke results (CPU-side decode on `"What is 2+2?"`).** Both
+  merged adapters produced **coherent math output** — the merged
+  policy can still reason ("2+2=4" is correct, the chain-of-thought
+  is sensible). But both **lost format discipline**:
+  - `<think>...</think>` blocks **empty** (no reasoning content
+    surfaced inside the thinking tags).
+  - `\boxed{...}` answer wrapping **missing** in the final response.
+  - Linear and DARE-drop variants both exhibited the same failure
+    shape — DARE drop=0.2 did not rescue format emission.
+- **Diagnostic NOT run on MATH-500 / validation.** The smoke-test
+  failure (no `\boxed{}`) means the CI scorer would extract empty
+  answers from every problem and report pass@8 ≈ 0.00 regardless
+  of underlying math reasoning quality. Skipped the full diagnostic
+  because the gating criterion (boxed answer present in n=8 trials
+  per problem) was already violated on the simplest test.
+- **What we learned.** **LoRA weight-space linear blending breaks
+  format-emission discipline at 1.7B under this adapter spec.** The
+  three adapters (v3, v5, v6) were all trained with byte-identical
+  chat templates that include `<think>...</think>` and `\boxed{}`
+  emission conventions, but the discrete format-emission behavior
+  is not preserved under linear interpolation in the LoRA delta
+  space. DARE drop=0.2 — the standard tool for reducing
+  interference in same-task merges — did not rescue format
+  emission, suggesting the format behavior is **distributed across
+  many of the delta entries**, not concentrated in a sparse subset
+  that DARE could safely drop and resample. Implication for the
+  Phase 3 team merge (2026-05-19): the merge across four
+  **different-task** experts (math, knowledge, multilingual,
+  safety) may face the same format-breakage risk; the team should
+  budget for a same-task format-preservation diagnostic on the
+  merged group model before relying on its `\boxed{}` outputs.
+  Math-side did not contribute a merged-adapter candidate; v5 alone
+  goes into the merge.
+
+### 3.11 Teacher distillation infrastructure (built 2026-05-19, NOT deployed)
+
+- **Goal / hypothesis.** Use a stronger open quantized teacher
+  (Qwen3-32B-AWQ with thinking mode) to generate higher-quality
+  solution traces on the problems v5/v6 fail on, then SFT on a
+  failure-mining corpus. Targets the IntAlg / Precalc / Level 5
+  gaps that v6 partially recovered but v5 (the deployed checkpoint)
+  still has open.
+- **Five scripts built today (CPU-only unit tests; not yet run on
+  cluster except for smoke).**
+
+  | Script                             | Purpose                                     | Tests |
+  |------------------------------------|---------------------------------------------|-------|
+  | `scripts/merge_adapters.py`        | Weight-space LoRA merge w/ optional DARE    | 5     |
+  | `scripts/sample_failures.py`       | Mine per-problem model failures from eval   | 6     |
+  | `scripts/teacher_smoke.py`         | Sanity-test Qwen3-32B-AWQ teacher locally   | 5     |
+  | `scripts/teacher_distill.py`       | Production: teacher → JSONL distillation    | 6     |
+  | `scripts/extract_math_level45.py`  | Filter MATH-train to Level 4-5 problems     | 20    |
+
+- **Teacher smoke results on Qwen3-32B-AWQ (`scripts/teacher_smoke.py`).**
+
+  | Problem set                           | N  | format_rate | pass_rate | Notes                                          |
+  |---------------------------------------|----|-------------|-----------|------------------------------------------------|
+  | `validation_samples/math.jsonl` (olympiad) | 10 | **0.15**    | **0.15**  | Traces too long; truncated at `max_model_len=4096`. |
+  | MATH-train Level 4-5 (extracted)      | 10 | 0.70        | 0.45      | Better but still weak; thinking traces remain long. |
+
+- **The context-budget bind.** The 4096-token CI ceiling is binding
+  for the teacher pipeline. Qwen3-32B-AWQ in thinking mode reliably
+  emits multi-thousand-token `<think>...</think>` traces on
+  competition-difficulty problems; the formatted output then runs
+  past `max_model_len=4096` and gets truncated before the
+  `\boxed{...}` line. On olympiad-difficulty problems (the kind
+  v5/v6 fail on), the truncation rate is high enough that **only
+  15% of the 10-problem smoke set produced a format-valid + correct
+  trace**. On MATH-train Level 4-5 (which the targeted distillation
+  was intended to cover), the rate rose to 45% — still less than
+  half.
+- **Decision: NOT committed to overnight 4000-problem distillation.**
+  Expected yield at the MATH-train Level 4-5 rate (~45%) over a 4k-
+  problem pool is ~1,800 usable (problem, teacher-trace) pairs.
+  Folding 1,800 new training pairs into a v7 SFT (an OMI2 100k + 1.8k
+  teacher-trace mix) projects to **+1-3pp MATH-500 pass@1** on the
+  established scaling curve — and the v6 → CI regression shows
+  local-eval lift in that band may not transfer. Combined with the
+  overnight cluster runtime (~12-15h on 1×A100 for the distillation
+  pass plus a v7 SFT after) and the non-zero risk of further
+  format-discipline regression on the SFT side, the projected payoff
+  doesn't justify the cost. **Infrastructure preserved** for future
+  re-use if a longer-context teacher (or a relaxed CI cap) becomes
+  available.
+- **What we learned.** The available open quantized teachers
+  (specifically Qwen3-32B-AWQ in thinking mode) **face a context-
+  budget bind under the CS-552 CI's `max_model_len=4096` cap**.
+  Their thinking traces are competitive-quality but they consume
+  too much of the budget on hard problems, so the distilled corpus
+  would be skewed toward easier problems where v5 already excels —
+  exactly the wrong distribution for closing the hard-subject gap.
+  The infrastructure (5 scripts + 42 CPU-runnable tests) is built
+  and tested; the decision to not deploy is informed, not blocked
+  on engineering.
 
 ---
 
@@ -875,37 +1065,102 @@ These are the "discussion section" candidates for the final report.
   isn't the binding constraint on this set. So the TA's bump won't
   lift our headline. Re-check this if a future variant has markedly
   longer reasoning chains.
+- **Local-eval lift does not always transfer to CI at 1.7B
+  (2026-05-19 evidence).** v6 had +0.9pp on MATH-500 pass@1 vs v5
+  and partially recovered v5's hard-subject gaps (IntAlg +2.3pp,
+  Precalc +3.1pp, Level 5 +4.1pp) — a textbook "scaling helps hard
+  problems" curve. But the **CI grade regressed 0.34 → 0.31** on
+  the secret set. The CI distribution evidently leans easy/mid where
+  v6 lost (Counting -4.6pp, Prealgebra -1.2pp, Level 1 -1.8pp) more
+  than hard where v6 won. Lesson: **per-subject redistribution at
+  this capacity is a zero-sum trade, and the CI distribution
+  determines which trade wins**. MATH-500 is necessary but not
+  sufficient as a CI predictor.
+- **The validation_samples set has a hard ceiling near pass@8 = 0.5
+  on a 10-problem N (2026-05-19 evidence).** The pass@16
+  measurement on v5 (n=16 → reported pass@8 = 0.390) shows that
+  the n=8 single-temp 0.500 reading was the upper-tail of Chen-2021
+  estimator noise, not signal. The per-problem solve pattern: **4-5
+  of 10 are reliably solvable, 5-6 are at-or-beyond the 1.7B
+  reasoning frontier** at any temperature. Future improvements at
+  this capacity should target raising the per-problem solve rate on
+  the 5-6 hard ones — but local-eval scaling has so far failed to
+  do this (v5 → v6 trades within-distribution rather than lifting
+  the hardest tail).
+- **LoRA weight-space merging breaks format-emission discipline at
+  1.7B under our r=32 spec (2026-05-19 evidence).** Linear blends of
+  v3 + v5 + v6 (all math-only, all same chat template, all same
+  LoRA spec) produce coherent math reasoning but **empty
+  `<think>...</think>` blocks and missing `\boxed{...}`** — the
+  discrete format conventions don't survive linear interpolation
+  in the LoRA delta space. DARE drop=0.2 does not rescue. Implication:
+  the **Phase 3 four-expert merge (math + knowledge + multilingual
+  + safety) faces a real format-preservation risk**, even though
+  the merging *technique* is the same as what we already use. The
+  team should budget for a format-preservation diagnostic on the
+  merged group model before relying on its `\boxed{}` outputs.
+- **Available open quantized teachers face a context-budget bind at
+  the CI's `max_model_len=4096` cap (2026-05-19 evidence).** Qwen3-
+  32B-AWQ in thinking mode emits multi-thousand-token thinking
+  traces on competition-difficulty problems; the formatted output
+  then truncates before `\boxed{...}`. Smoke results: 15% pass_rate
+  on olympiad problems (the kind v5/v6 fail on), 45% on MATH-train
+  Level 4-5. A distillation pass on a 4k problem pool would yield
+  ~1,800 usable traces, projecting to +1-3pp MATH-500 — but the v6
+  CI regression in exactly that lift band shows the payoff doesn't
+  justify overnight runtime + format-regression risk. Teacher
+  distillation infrastructure built and CPU-tested (5 scripts, 42
+  unit tests); deployment deferred pending a longer-context teacher
+  or relaxed CI cap.
 
 ---
 
-## 6. What's deployed at end of day 2026-05-15
+## 6. What's deployed at end of day 2026-05-19
 
 - **Team HF (`cs-552-2026-emainelpe/math_model`).** **v5 OMI2 100k**
-  pushed 2026-05-15 13:05 UTC, replacing v4-resume. CI nightly grade
-  pending (will land overnight 2026-05-15 → 16).
+  is the final deployed math expert. Push timeline:
+  - 2026-05-15 13:05 UTC: v5 pushed (replaced v4-resume).
+  - 2026-05-16 04:57: v5 CI grade = **0.34** (within v3's grade band
+    of 0.32/0.35). Stayed deployed.
+  - 2026-05-19: v6 pushed for one CI cycle as an upgrade attempt.
+    Graded **0.31** — regression. Rolled back to v5 the same day.
+  - 2026-05-20 (pending): v5 re-graded after rollback to confirm.
 - **Personal HF backups (Julien).**
   - v1: `JulienE220/math-adapter-sft-dart50k-r32-20260508` ✅
   - v2: `JulienE220/math-adapter-sft-mixed-50k-r32-20260511` ✅
   - v3: `JulienE220/math-adapter-sft-omi2-50k-r32-20260511` ✅
-  - v4-fresh: ⏳ pending push (deferred from 2026-05-14)
+  - v4-fresh: ⏳ pending push (underperformed v4-resume; low priority)
   - v4-resume: `JulienE220/math-adapter-sft-v4-resume-r32-20260514`
     ⏳ pending push (deferred from 2026-05-14)
   - v5: `JulienE220/math-adapter-sft-v5-omi2-100k-r32-20260515` ✅
-  - v6: ⏳ pending push (planned 2026-05-16 as
-    `JulienE220/math-adapter-sft-v6-omi2-200k-r32-20260516`)
+  - v6: ⏳ pending push as
+    `JulienE220/math-adapter-sft-v6-omi2-200k-r32-20260516`
 - **Cluster artifacts.**
   - `/scratch/Julien/merged/math_model_v3` — v3 SFT merged
   - `/scratch/Julien/merged/math_model_v5_omi2_100k` — v5 merged
-    (sourced for team HF push)
+    (sourced for team HF push, currently deployed)
   - `/scratch/Julien/merged/math_model_v6_omi2_200k` — v6 merged,
-    **NOT pushed** (pending v5 CI signal)
+    pushed once 2026-05-19, **rolled back same day** after CI 0.31
   - `/scratch/Julien/merged/math_model_rlvr_ckpt650` — RLVR ckpt-650
     merged, evaluated → noise vs v3 → not a deployment candidate
-- **Critical decision point for 2026-05-16 morning.** Based on v5 CI
-  nightly grade:
-  - v5 ≥ v3 CI → keep v5, optionally push v6 as an upgrade attempt.
-  - v5 ≈ v3 CI → keep v5, do not push v6.
-  - v5 < v3 CI → roll back to v3 immediately on team HF.
+  - Multi-adapter merge experiments (v3+v5+v6 linear and DARE drop=0.2):
+    smoke-tested only, format collapse observed, no merged dir
+    promoted to a deployment candidate.
+- **Final deployed math expert.** v5 OMI2 100k SFT
+  (`cs552-erbland-g65-v4-fresh-20260514-162214/final`). v6, RLVR-
+  ckpt650, and multi-adapter merges were all evaluated and **none
+  beat v5 on the surface that matters (CI pass@8 on the secret set)**.
+- **What did NOT make it into deployment.**
+  - **v6 (OMI2 200k).** +0.9pp MATH-500 local lift; -3pp CI regression.
+  - **RLVR-checkpoint650.** 16.5%-epoch GRPO refinement; no measurable
+    lift vs v3 (within noise on MATH-500).
+  - **Multi-adapter weight-space merges (v3+v5+v6).** Format
+    discipline lost; smoke-test failed on `\boxed{}` emission.
+  - **Teacher-distilled v7.** Infrastructure built (`scripts/teacher_*.py`,
+    `extract_math_level45.py`), but the Qwen3-32B-AWQ teacher pass_rate
+    on hard problems (15-45%) made the expected payoff (+1-3pp local,
+    likely 0 or negative on CI given the v6 evidence) not worth the
+    overnight runtime + format-regression risk. Not deployed.
 
 ---
 
@@ -928,18 +1183,26 @@ These are the "discussion section" candidates for the final report.
   (0.514 → 0.516 → 0.525), cumulative +1.1pp over 4× more data.
   Diminishing-returns curve — true ceiling unknown. Open whether v7
   at 400k or 500k continues the trajectory or hits a hard wall.
-- **NEW: Does v5 or v6 actually improve CI nightly grade vs v3?**
-  v5's first CI nightly grade lands overnight 2026-05-15 → 16. v5
-  is the candidate to grade because it's deployed; v6 is held in
-  reserve. If v5 CI < v3's ~0.32, the local→CI gap is wider than
-  the local→CI gap was for v3, and the "scaling helps" finding
-  may not transfer.
-- Is the team Phase 3 merge (2026-05-19) going to use v3, v5, or v6?
-  Decision pending v5 CI grade and team alignment.
+- ~~Does v5 or v6 actually improve CI nightly grade vs v3?~~
+  **ANSWERED (2026-05-19).** v5 CI = 0.34 (within v3's 0.32/0.35 grade
+  band — no significant CI lift, no regression). v6 CI = 0.31
+  (real regression vs v5). The local→CI transfer is **partial for
+  v5 and negative for v6**. The +4.8pp in-distribution lift for v5
+  buys at most 0pp CI lift; the +0.9pp MATH-500 lift for v6 buys
+  -3pp CI. Lesson: scaling helps the in-distribution and MATH-500
+  surfaces but does not monotonically transfer to the CI secret set
+  at this capacity.
+- ~~Is the team Phase 3 merge (2026-05-19) going to use v3, v5, or
+  v6?~~ **ANSWERED — v5.** v6 was tested in production for one cycle
+  and rolled back; v3 was superseded by v5. The math expert
+  contributing to the Phase 3 group merge is **v5 OMI2 100k SFT**.
 - Is the v3 nightly CI grade of 0.32 robust across nightly draws,
-  or was it near the top of its noise distribution? Need multiple
-  nightly grades on v3 to estimate variance. (TODO: check with
-  team — has v3 been graded more than once?)
+  or was it near the top of its noise distribution? Two v3 draws
+  observed (0.32 and 0.35) suggest ±1.5pp drift around 0.335. v5's
+  0.34 lands inside this band — so the "v5 lifts v3" claim on CI is
+  unsupported at the resolution we have. **A third v3 draw would
+  cost a deployment cycle we don't have**; the team-shared math
+  expert is v5 going forward.
 - Why is Level 5 pass@1 so much weaker than Level 1 across **every**
   variant we trained? Capacity-bound argument suggests the rank
   ordering can't be flipped by SFT alone, but v6 lifts Level 5 by
@@ -948,6 +1211,38 @@ These are the "discussion section" candidates for the final report.
   Level 5 hit a hard capacity ceiling that scaling can't push past?
   Our rescue prompt set was signal-banded across all difficulty;
   Level-targeted RLVR remains untested.
+- ~~Does multi-adapter weight-space LoRA merging across v3/v5/v6
+  yield a Pareto-better operating point?~~ **ANSWERED — no
+  (2026-05-19).** Linear blend at `(v3=0.2, v5=0.5, v6=0.3)` and
+  DARE drop=0.2 at the same weights both produced coherent math but
+  empty `<think>` and missing `\boxed{}`. The format-emission
+  behavior does not survive linear interpolation in the LoRA delta
+  space, even within a single task. See §3.10.
+- ~~Would a Qwen3-32B-AWQ teacher distillation pipeline lift v5?~~
+  **NOT TESTED — infrastructure built but not deployed.** The
+  context-budget bind (Qwen3-32B in thinking mode truncates beyond
+  4096 tokens on competition-difficulty problems) gave a 15-45%
+  pass_rate on the smoke set; expected distilled yield (~1,800
+  usable pairs over a 4k pool) projects to +1-3pp MATH-500 — same
+  band where v6's local lift failed to transfer to CI. The 5-script
+  infrastructure (`scripts/teacher_*.py`, `extract_math_level45.py`,
+  `sample_failures.py`, `merge_adapters.py`) is preserved for
+  future re-use if a longer-context teacher becomes available. See
+  §3.11.
+- **NEW: Does the Phase 3 four-expert merge preserve `\boxed{}`
+  emission on the math side?** Open as of 2026-05-19. The §3.10
+  finding (same-task LoRA blends lose format discipline at 1.7B)
+  suggests **the cross-task four-expert merge faces a real risk of
+  format breakage**. Mitigation: budget a format-preservation smoke
+  test on the merged group model output before any team submission.
+- **NEW: How wide is the local→CI gap, structurally?** v5 ≈ v3 on
+  CI despite +4.8pp in-distribution pass@1 and tied MATH-500. v6 →
+  CI regressed despite +0.9pp MATH-500. Both data points indicate
+  the CI secret set has a distribution **distinct from MATH-500
+  and from OMI2 in-distribution**. Without access to CI grade
+  variance estimates, we can't quantify the gap precisely — but it's
+  wide enough that local-eval scaling is **not** a reliable proxy
+  for CI scaling at 1.7B + r=32 + OMI2 SFT.
 
 ---
 
@@ -976,8 +1271,23 @@ These are the "discussion section" candidates for the final report.
   - `/scratch/Julien/diagnostics/v5_eval/`
   - `/scratch/Julien/diagnostics/v6_eval/`
   - `/scratch/Julien/diagnostics/rlvr_ckpt650_eval/`
-  - `/scratch/Julien/v5_temp_sweep/`
+  - `/scratch/Julien/v5_temp_sweep/` (5-temp sweep 0.4-0.8)
+  - `/scratch/Julien/v5_temp_sweep_lowtemp/` (low-temp 0.20-0.40,
+    added 2026-05-19)
+  - `/scratch/Julien/v5_pass16/` (n=16 pass@8 measurement,
+    added 2026-05-19)
   - `/scratch/Julien/v6_temp_sweep/`
+- **Scripts added 2026-05-19 (CPU-tested, not yet cluster-deployed).**
+  - `scripts/merge_adapters.py` — weight-space LoRA merge w/ DARE
+    (5 tests). Used for the multi-adapter merge smoke test in §3.10.
+  - `scripts/sample_failures.py` — failure-mining JSONL emitter
+    (6 tests).
+  - `scripts/teacher_smoke.py` — Qwen3-32B-AWQ thinking-mode smoke
+    test (5 tests).
+  - `scripts/teacher_distill.py` — production teacher distillation
+    (6 tests).
+  - `scripts/extract_math_level45.py` — MATH-train Level 4-5
+    filter (20 tests).
 - **W&B project.** `https://wandb.ai/julienerbland-epfl/emainelpe-math`
   - v3 SFT: cs552-erbland-g65-v3-omi2-fix2-20260511-152150
   - v4-fresh: `k93kbsns`
@@ -997,36 +1307,48 @@ These are the "discussion section" candidates for the final report.
 
 ---
 
-## TODO list for 2026-05-16 morning (carry-over from CLAUDE.md daily log)
+## Closed TODO list from 2026-05-16 (status)
 
-1. Find v5's CI nightly grade (graded overnight 2026-05-15 → 16).
-2. Decide based on v5 CI grade:
-   - v5 ≥ v3 CI → keep v5, consider pushing v6 as upgrade.
-   - v5 ≈ v3 CI → keep v5, do NOT push v6.
-   - v5 < v3 CI → roll back to v3 immediately.
-3. Push v6 to personal HF backup:
+1. ✅ Found v5's CI nightly grade (0.34, 2026-05-16 04:57).
+2. ✅ Decision: v5 ≈ v3 CI → kept v5 deployed; held v6 in reserve
+   for a later upgrade attempt.
+3. ❌ v6 personal HF backup not yet pushed (deferred to 2026-05-20).
+4. ❌ v4-resume + v4-fresh personal backups not yet pushed
+   (deferred again).
+5. ✅ Phase 3 merge prep started; merge_adapters.py infrastructure
+   built 2026-05-19 (used for the same-task smoke test in §3.10).
+
+## Closed TODO list from 2026-05-19 (status)
+
+1. ✅ Pushed v6 to team HF for one CI cycle as an upgrade attempt.
+2. ✅ Observed v6 CI grade (0.31) — regression vs v5 (0.34).
+3. ✅ Rolled back v6 → v5 on team HF same day.
+4. ✅ Re-measured v5 with pass@16 (n=16 → reported pass@8 = 0.390).
+5. ✅ Ran low-temperature sweep on v5 (0.20-0.40).
+6. ✅ Built 5-script teacher distillation + failure-mining
+   infrastructure with 42 CPU-runnable unit tests; smoke-tested
+   Qwen3-32B-AWQ teacher; decided NOT to deploy overnight
+   distillation given context-budget bind and projected payoff.
+7. ✅ Ran multi-adapter weight-space merge smoke (v3+v5+v6 linear
+   and DARE drop=0.2); observed format-discipline collapse.
+8. ✅ Updated REPORT.md (this revision): added §3.7.1 follow-up,
+   §3.10 merge experiments, §3.11 teacher distill infra, refreshed
+   §5 with five new insights, rewrote §6 / §7 / §8 against
+   2026-05-19 deployment state.
+
+## Pending tasks for 2026-05-20
+
+1. Observe v5 CI re-grade after the v6 rollback (confirm v5 ≈ 0.34
+   is stable, not a one-time draw).
+2. Push v6 to personal HF backup as
    `JulienE220/math-adapter-sft-v6-omi2-200k-r32-20260516`.
-4. Push v4-resume + v4-fresh to personal HF backups (deferred from
-   2026-05-14).
-5. Begin Phase 3 group merge prep (4 days to the 2026-05-19
-   milestone). Confirm with team that the adapter on
-   `cs-552-2026-emainelpe/math_model` matches the merge contract
-   (locked LoRA r/alpha/target_modules; locked chat template).
-6. Update REPORT.md §6 once v5 CI grade and v6 push decision land.
-
-## Closed TODO list from 2026-05-15 (status)
-
-1. ✅ Checked v4-resume CI grade (one cycle observed).
-2. ✅ Re-pushed v3? — Superseded by v5 push (better signal than
-   re-pushing v3).
-3. ❌ v4-resume personal backup not yet pushed (deferred).
-4. ✅ RLVR rescue completion checked — final adapter collapsed,
-   recovered ckpt-650.
-5. ✅ v5 completion checked — final loss ~0.40.
-6. ✅ Merged each adapter (v5, v6, RLVR-ckpt650).
-7. ✅ 5-temp sweep on v5 and v6.
-8. ✅ `diagnose_v3.py` per-subject on v5, v6, RLVR-ckpt650.
-9. ✅ Decision: v5 to team HF (pushed 13:05 UTC); v6 held in
-   reserve.
-10. ✅ REPORT.md §3.7, §3.8 filled; new §3.9 for v6; §5/§6/§7
-    updated.
+3. Push v4-resume + v4-fresh personal HF backups (continuing to
+   defer is fine if storage isn't urgent).
+4. Coordinate with team on Phase 3 group merge: confirm v5's adapter
+   on `cs-552-2026-emainelpe/math_model` is the math contribution,
+   and budget a format-preservation smoke test on the merged group
+   model (see §3.10 risk).
+5. Decide whether to commit the 5 new scripts
+   (`merge_adapters.py`, `sample_failures.py`, `teacher_smoke.py`,
+   `teacher_distill.py`, `extract_math_level45.py`) — they exist
+   on disk with passing tests but are not yet in git.
