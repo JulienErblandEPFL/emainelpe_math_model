@@ -244,7 +244,12 @@ def grpo_config_kwargs(
         "logging_steps": 1,             # log every step — RL runs are short
         "save_strategy": "steps",
         "save_steps": 50,
-        "save_total_limit": 2,
+        # Tina methodology: keep many checkpoints so we can pick the best
+        # one POST-HOC (typically lands BEFORE the format-reward phase
+        # transition / policy collapse — see RLVR rescue notes in
+        # CLAUDE.md). At save_steps=50, 20 limit = 1000 steps of history.
+        # ~140 MB per LoRA checkpoint × 20 ≈ 2.8 GB on the 85 TB scratch.
+        "save_total_limit": 20,
         "report_to": "wandb" if use_wandb else "none",
         "run_name": run_name,
         "seed": args.seed,

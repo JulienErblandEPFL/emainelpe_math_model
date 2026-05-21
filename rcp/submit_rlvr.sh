@@ -42,6 +42,13 @@
 #   KL_COEF       train_rlvr.py --kl-coef. Default: 0.04
 #   ROLLOUT_TEMP  train_rlvr.py --rollout-temp. Default: 0.8
 #   MAX_NEW_TOKENS    train_rlvr.py --max-new-tokens. Default: 4096
+#   LENGTH_BONUS_WEIGHT   train_rlvr.py --length-bonus-weight. Default: 0.0
+#                         (OFF) — when > 0, rewards shorter CORRECT completions
+#                         (correctness still dominates; conciseness gates on
+#                         is_equiv agreement). Suggested operational range: 0.1.
+#   TARGET_LENGTH_TOKENS  train_rlvr.py --target-length-tokens. Default: 1024
+#                         (token length at which the conciseness bonus = 0.5;
+#                         only consulted when LENGTH_BONUS_WEIGHT > 0).
 #   SKIP_CURATION If "1", skip prepare_rlvr.py (use existing PROMPT_SET).
 #                 Default: empty (run curation).
 #   SKIP_PREFLIGHTS  If "1", forward --skip-preflights to train_rlvr.py.
@@ -155,6 +162,8 @@ TRAIN_FLAGS+="${MASK_TRUNCATED:+ --mask-truncated-completions}"
 TRAIN_FLAGS+="${LOG_COMPLETIONS:+ --log-completions}"
 TRAIN_FLAGS+="${HARD_KILL_ON_WEAK_SIGNAL:+ --hard-kill-on-weak-signal}"
 TRAIN_FLAGS+="${SKIP_PREFLIGHTS:+ --skip-preflights}"
+TRAIN_FLAGS+=" --length-bonus-weight ${LENGTH_BONUS_WEIGHT:-0.0}"
+TRAIN_FLAGS+=" --target-length-tokens ${TARGET_LENGTH_TOKENS:-1024}"
 
 CURATION_FLAGS="--input-jsonl ${DATA_OUT_DIR}/train.jsonl"
 CURATION_FLAGS+=" --sft-model-path ${SFT_MODEL}"
@@ -229,6 +238,8 @@ if (( DRY_RUN )); then
   echo "KL_COEF        : ${KL_COEF}"
   echo "ROLLOUT_TEMP   : ${ROLLOUT_TEMP}"
   echo "MAX_NEW_TOKENS : ${MAX_NEW_TOKENS}"
+  echo "LENGTH_BONUS   : ${LENGTH_BONUS_WEIGHT:-0.0}"
+  echo "TARGET_LENGTH  : ${TARGET_LENGTH_TOKENS:-1024}"
   echo "SKIP_CURATION  : ${SKIP_CURATION:-<unset>}"
   echo "SKIP_PREFLIGHTS: ${SKIP_PREFLIGHTS:-<unset>}"
   echo
