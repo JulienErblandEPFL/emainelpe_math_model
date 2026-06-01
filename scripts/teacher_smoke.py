@@ -4,7 +4,7 @@ Loads a large math-tuned teacher (default ``Qwen/Qwen3-32B-AWQ``) via
 vLLM with AWQ quantization and probes whether it produces
 well-formatted ``<think>...</think>`` + ``\\boxed{...}`` solutions on
 the local validation problems. Scoring goes through the same
-``evaluate.score.score_generations`` path as ``scripts/eval_local.py``
+``evaluate.score.score_generations`` path as ``scripts/run_eval.py``
 so the teacher's pass rate is directly comparable to the student SFT
 checkpoint's headline number.
 
@@ -51,8 +51,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Reuse eval_local's stdlib-only JSONL helpers (no torch).
-from scripts.eval_local import load_eval_jsonl, normalize_input_row
+# Reuse run_eval's stdlib-only JSONL helpers (no torch).
+from scripts.run_eval import load_eval_jsonl, normalize_input_row
 
 logger = logging.getLogger("teacher_smoke")
 
@@ -322,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         [co.text for co in out.outputs] for out in outputs
     ]
 
-    # 5. Score via the vendored CI scorer (same path as eval_local).
+    # 5. Score via the vendored CI scorer (same path as run_eval).
     from evaluate.score import score_generations
     score_input = [
         {"prompt": it["prompt"], "answer": it["answer"], "completions": comps}

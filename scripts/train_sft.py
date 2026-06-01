@@ -219,7 +219,7 @@ def sft_config_kwargs(
 
     Eval-strategy note: ``eval_steps`` measures token-level cross-entropy
     on a held-out slice of the SAME training distribution. It does NOT
-    measure math accuracy — that lives in Stage 4 (scripts/eval_local.py).
+    measure math accuracy — that lives in Stage 4 (scripts/run_eval.py).
     A flat eval-loss curve does not necessarily mean the model has stopped
     improving on math; a falling eval-loss curve does not guarantee
     pass@1 went up.

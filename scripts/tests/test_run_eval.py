@@ -1,4 +1,4 @@
-"""Tests for ``scripts/eval_local.py``.
+"""Tests for ``scripts/run_eval.py``.
 
 CPU-only. Never imports ``vllm``, ``torch``, ``transformers.AutoTokenizer``,
 or ``AutoConfig`` — those live in runtime helpers we don't unit-test.
@@ -28,7 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.eval_local import (
+from scripts.run_eval import (
     CI_MAX_MODEL_LEN,
     CI_MAX_NEW_TOKENS,
     FALLBACK_TEMPERATURE,
@@ -253,7 +253,7 @@ def test_check_max_model_len_error_mentions_both_numbers():
 
 def test_resolve_context_caps_no_args_returns_ci_caps():
     """No flags, no overrides → CI-faithful 4096 / 4096. This is the
-    headline default-flip: a fresh ``python scripts/eval_local.py``
+    headline default-flip: a fresh ``python scripts/run_eval.py``
     invocation is now calibrated against what CI will see, not the
     legacy permissive 20480/16384."""
     mml, mnt = resolve_context_caps()

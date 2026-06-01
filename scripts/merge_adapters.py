@@ -31,7 +31,7 @@ with ``pytest.importorskip``.
 Out of scope:
   - Rank-expanding merges (concatenating adapters into rank Nr). That
     would break the Phase 3 ``configs/lora.yaml`` contract.
-  - Base-model fold-in. ``merge_and_push.py`` handles that.
+  - Base-model fold-in. ``merge.py / push.py`` handles that.
   - TIES sign-resolution / trim. Pure linear + optional DARE only.
 """
 from __future__ import annotations

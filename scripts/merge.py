@@ -1,38 +1,23 @@
-"""Merge a trained LoRA adapter into ``Qwen/Qwen3-1.7B`` and push the
-merged checkpoint to the team org repo on the Hugging Face Hub.
+"""Merge a trained LoRA adapter into ``Qwen/Qwen3-1.7B`` and write a
+complete, vLLM-compatible checkpoint to disk.
 
-Stage 5 in ``IMPLEMENTATION_PLAN.md``. Sets the eval-time contract: the
-``generation_config.json`` written here is what the CS-552 CI samples
-with at evaluation time. See "Eval contract" in ``CLAUDE.md``.
+This is the merge half of the former ``scripts/merge_and_push.py``. It
+writes everything the course CI needs (merged safetensors, ``config.json``,
+tokenizer files, locked chat template, and ``generation_config.json``)
+to ``--output-dir`` and runs a vLLM smoke check that the merged model
+emits a parseable ``\\boxed{...}``. It does NOT push anywhere — use
+``scripts/push.py`` for that.
 
 Pure helpers (``write_generation_config``, ``chat_templates_byte_match``,
 ``read_saved_chat_template``, ``run_file_preflight``) live at module
-scope and are CPU-testable. The heavy ML pieces (``transformers``,
-``peft``, ``vllm``) and the ``huggingface_hub`` push are deferred into
-``main()`` so the unit tests run on a laptop without those wheels.
+scope and are CPU-testable. Heavy pieces (``transformers``, ``peft``,
+``vllm``) are deferred into ``main()``.
 
-Dry-run (default — does everything except the HF push)::
+Usage::
 
-    python scripts/merge_and_push.py \\
+    python scripts/merge.py \\
         --adapter-dir <path/to/adapter/final> \\
         --output-dir  <path/to/merged_model>
-
-Push to a HF repo (must specify --hf-repo explicitly)::
-
-    python scripts/merge_and_push.py \\
-        --adapter-dir <path/to/adapter/final> \\
-        --output-dir  <path/to/merged_model> \\
-        --hf-repo     <your-org/your-repo> \\
-        --push
-
-Out of scope (deferred — see CLAUDE.md and IMPLEMENTATION_PLAN.md):
-  - Temperature/top_p/top_k sweep. The CLI defaults are the BASELINE.md
-    fallback (0.3 / 0.95 / 20). A future tuning re-push is one CLI invocation.
-  - Personal-HF intermediate. The user opted to push straight to the team
-    repo; --hf-repo is exposed only for an emergency override.
-  - Automatic post-push eval. Eval is run separately via
-    ``scripts/eval_local.py`` (Stage 4).
-  - RLVR (Stage 7).
 """
 from __future__ import annotations
 
@@ -43,18 +28,16 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-logger = logging.getLogger("merge_and_push")
+logger = logging.getLogger("merge")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCKED_TEMPLATE = REPO_ROOT / "chat_template" / "chat_template.jinja"
-
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "merged_model"
 
 BASE_MODEL_ID = "Qwen/Qwen3-1.7B"
 
 # Qwen3 special-token IDs (from the published tokenizer config). Pinned
-# here so the generation_config.json schema is identical across pushes
-# and across teammates' merged checkpoints.
+# here so the generation_config.json schema is identical across merges.
 QWEN3_BOS_TOKEN_ID = 151643
 QWEN3_PAD_TOKEN_ID = 151643
 QWEN3_EOS_TOKEN_IDS = (151645, 151643)
@@ -73,7 +56,7 @@ GENERATION_CONFIG_REQUIRED_KEYS = (
 
 
 class PreflightError(RuntimeError):
-    """Raised when a pre-push sanity check fails."""
+    """Raised when a pre-write sanity check fails."""
 
 
 # =============================================================================
@@ -118,12 +101,7 @@ def write_generation_config(
 
 
 def chat_templates_byte_match(saved: Path, locked: Path) -> bool:
-    """Byte-for-byte compare two chat-template files.
-
-    Used by the preflight: any drift between the locked Jinja and what
-    landed in the merged checkpoint silently breaks thinking mode at CI
-    time.
-    """
+    """Byte-for-byte compare two chat-template files."""
     return Path(saved).read_bytes() == Path(locked).read_bytes()
 
 
@@ -167,8 +145,6 @@ def run_file_preflight(output_dir: Path, locked_template: Path) -> None:
     """File-system preflight checks. Pure: no model loading.
 
     Raises ``PreflightError`` on the first failure with a clear message.
-    Order of checks is deliberate — config first (cheapest), then weight
-    files, then tokenizer, then chat-template byte-diff.
     """
     output_dir = Path(output_dir)
     locked_template = Path(locked_template)
@@ -216,12 +192,8 @@ def run_file_preflight(output_dir: Path, locked_template: Path) -> None:
         raise PreflightError(
             "Saved chat_template differs from the locked file at "
             f"{locked_template}. The Phase 3 merge requires byte-identical "
-            "templates across all four experts; refusing to push."
+            "templates across all four experts; refusing to proceed."
         )
-
-
-def default_commit_message(adapter_dir: Path) -> str:
-    return f"merged model from {Path(adapter_dir).name}"
 
 
 # =============================================================================
@@ -230,8 +202,8 @@ def default_commit_message(adapter_dir: Path) -> str:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Merge a LoRA adapter into Qwen3-1.7B and (optionally) "
-                    "push the merged checkpoint to the team HF org.",
+        description="Merge a LoRA adapter into Qwen3-1.7B and write a "
+                    "complete vLLM-compatible checkpoint to disk.",
     )
     p.add_argument(
         "--adapter-dir", type=Path, required=True,
@@ -243,28 +215,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              f"Default: {DEFAULT_OUTPUT_DIR} (repo-relative).",
     )
     p.add_argument(
-        "--hf-repo", default=None,
-        help="HF repo to push to (e.g. 'your-org/your-repo'). No default; "
-             "required when --push is set.",
-    )
-    p.add_argument(
         "--temperature", type=float, default=0.4,
         help="Sampling temperature written into generation_config.json. "
              "Default 0.4: the calibrated peak from the 2026-05-11 SFT "
-             "temperature sweep (v3 maximizes pass@8 here). See CLAUDE.md "
-             "→ 'Inference temperature' and docs/BASELINE.md → "
-             "'2026-05-11 SFT comparison and temperature sweep'.",
+             "temperature sweep.",
     )
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=20)
-    p.add_argument(
-        "--push", action="store_true",
-        help="If absent, run merge + preflight + smoke but skip the HF push.",
-    )
-    p.add_argument(
-        "--commit-message", default=None,
-        help="HF commit message. Default: 'merged model from <adapter-dir-basename>'.",
-    )
     p.add_argument(
         "--locked-template", type=Path, default=DEFAULT_LOCKED_TEMPLATE,
         help="Locked chat template Jinja, used by the byte-diff preflight.",
@@ -281,11 +238,7 @@ def _setup_logging() -> None:
 
 
 def merge_adapter_and_save(adapter_dir: Path, output_dir: Path) -> None:
-    """Load base + adapter, merge, save merged weights and tokenizer.
-
-    Heavy. Requires GPU (or CPU with patience) and the training-side
-    wheels installed.
-    """
+    """Load base + adapter, merge, save merged weights and tokenizer."""
     import torch
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -317,10 +270,7 @@ def merge_adapter_and_save(adapter_dir: Path, output_dir: Path) -> None:
 
 
 def smoke_inference_vllm(output_dir: Path, gen_cfg: dict) -> str:
-    """vLLM smoke: 'What is 2+2?' → must contain <think> and \\boxed{.
-
-    Mirrors the CI's call shape (chat template + generation_config sampling).
-    """
+    """vLLM smoke: 'What is 2+2?' → must contain <think> and \\boxed{."""
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
@@ -369,43 +319,6 @@ def smoke_inference_vllm(output_dir: Path, gen_cfg: dict) -> str:
     return text
 
 
-def push_to_hub(
-    output_dir: Path, hf_repo: str, commit_message: str
-) -> str:
-    """Upload --output-dir as a folder, then re-upload generation_config.json.
-
-    The explicit re-upload is a guard against transformers version drift
-    during folder upload silently rewriting generation_config.json.
-    """
-    from huggingface_hub import HfApi
-
-    output_dir = Path(output_dir)
-    api = HfApi()
-
-    logger.info("Ensuring HF repo %s exists", hf_repo)
-    api.create_repo(repo_id=hf_repo, exist_ok=True, repo_type="model")
-
-    logger.info("Uploading folder %s to %s", output_dir, hf_repo)
-    api.upload_folder(
-        folder_path=str(output_dir),
-        repo_id=hf_repo,
-        repo_type="model",
-        commit_message=commit_message,
-    )
-
-    gen_cfg_path = output_dir / "generation_config.json"
-    logger.info("Re-uploading %s explicitly", gen_cfg_path.name)
-    api.upload_file(
-        path_or_fileobj=str(gen_cfg_path),
-        path_in_repo="generation_config.json",
-        repo_id=hf_repo,
-        repo_type="model",
-        commit_message=f"{commit_message} (re-upload generation_config.json)",
-    )
-
-    return f"https://huggingface.co/{hf_repo}"
-
-
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
     args = _parse_args(argv)
@@ -413,14 +326,6 @@ def main(argv: list[str] | None = None) -> int:
     adapter_dir: Path = args.adapter_dir
     output_dir: Path = args.output_dir
     locked_template: Path = args.locked_template
-    commit_message = args.commit_message or default_commit_message(adapter_dir)
-
-    if args.push and not args.hf_repo:
-        logger.error(
-            "--push requires --hf-repo; refusing to guess. "
-            "Pass --hf-repo <your-org/your-repo> explicitly."
-        )
-        return 2
 
     if not adapter_dir.is_dir():
         logger.error("Adapter dir does not exist: %s", adapter_dir)
@@ -439,8 +344,6 @@ def main(argv: list[str] | None = None) -> int:
         "sampling      = temperature=%s top_p=%s top_k=%s",
         args.temperature, args.top_p, args.top_k,
     )
-    logger.info("hf_repo       = %s", args.hf_repo)
-    logger.info("push enabled  = %s", args.push)
 
     # ---- merge + save ------------------------------------------------------
     try:
@@ -498,33 +401,19 @@ def main(argv: list[str] | None = None) -> int:
         logger.exception("Smoke inference failed: %s", e)
         return 6
 
-    # ---- push (only if --push) --------------------------------------------
-    repo_url = None
-    if args.push:
-        try:
-            repo_url = push_to_hub(output_dir, args.hf_repo, commit_message)
-            logger.info("Pushed to %s", repo_url)
-        except Exception as e:
-            logger.exception("HF push failed: %s", e)
-            return 7
-    else:
-        logger.info("Dry-run: --push not set, skipping HF upload.")
-
     # ---- summary ----------------------------------------------------------
     print("\n" + "=" * 60)
-    print("merge_and_push: SUCCESS")
+    print("merge: SUCCESS")
     print("=" * 60)
     print(f"  adapter_dir   : {adapter_dir}")
     print(f"  output_dir    : {output_dir}")
     print(f"  temperature   : {args.temperature}")
     print(f"  top_p         : {args.top_p}")
     print(f"  top_k         : {args.top_k}")
-    print(f"  hf_repo       : {args.hf_repo}")
-    print(f"  pushed        : {repo_url if repo_url else 'no (dry-run)'}")
-    print(f"  commit_message: {commit_message}")
     print()
-    print("Next steps: run scripts/eval_local.py against the merged checkpoint")
-    print("to measure pass@1 / pass@8 before any HF re-push.")
+    print("Next steps:")
+    print("  - Evaluate locally: python scripts/run_eval.py --model <output-dir>")
+    print("  - Upload:           python scripts/push.py --model-dir <output-dir> --hf-repo <org/repo>")
     return 0
 
 

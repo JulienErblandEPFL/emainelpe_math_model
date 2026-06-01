@@ -45,7 +45,7 @@ underlying decisions.
 
 Smoke run on RCP (Stage 4 "Done when" criterion):
 
-    python scripts/eval_local.py \\
+    python scripts/run_eval.py \\
         --model Qwen/Qwen3-1.7B \\
         --output-dir runs/eval_baseline
 """
@@ -58,9 +58,9 @@ import sys
 from pathlib import Path
 
 # Put repo root on sys.path so ``from evaluate.score import ...`` works
-# whether the script is invoked via ``python scripts/eval_local.py``
+# whether the script is invoked via ``python scripts/run_eval.py``
 # (which prepends scripts/ to sys.path, hiding the evaluate package) or
-# ``python -m scripts.eval_local``. Same idiom as scripts/tests/conftest.py.
+# ``python -m scripts.run_eval``. Same idiom as scripts/tests/conftest.py.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

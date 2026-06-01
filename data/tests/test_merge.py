@@ -1,9 +1,8 @@
-"""CPU-only tests for scripts/merge_and_push.py.
+"""CPU-only tests for scripts/merge.py.
 
-Exercise only the pure helpers (gen-config writer, chat-template byte
-diff, file-existence preflight). The actual merge, smoke inference, and
-HF push need a GPU + credentials and are out of scope here. Should run
-in well under 30s on a laptop.
+Exercise the pure helpers (gen-config writer, chat-template byte diff,
+file-existence preflight). The actual merge and vLLM smoke inference
+need a GPU and are out of scope here.
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import json
 
 import pytest
 
-from scripts.merge_and_push import (
+from scripts.merge import (
     GENERATION_CONFIG_REQUIRED_KEYS,
     PreflightError,
     QWEN3_BOS_TOKEN_ID,
@@ -20,7 +19,6 @@ from scripts.merge_and_push import (
     TRANSFORMERS_VERSION,
     build_generation_config,
     chat_templates_byte_match,
-    default_commit_message,
     read_saved_chat_template,
     run_file_preflight,
     write_generation_config,
@@ -39,9 +37,6 @@ def test_build_generation_config_uses_cli_sampling_values():
 
 
 def test_build_generation_config_locks_qwen3_token_ids_and_do_sample():
-    """do_sample, BOS/EOS/pad, and transformers_version are NOT CLI-controlled.
-    Pinning them here means a future change to the schema fails this test
-    instead of silently shipping a checkpoint that the CI samples wrong."""
     cfg = build_generation_config(temperature=0.3, top_p=0.95, top_k=20)
     assert cfg["do_sample"] is True
     assert cfg["bos_token_id"] == QWEN3_BOS_TOKEN_ID
@@ -65,7 +60,6 @@ def test_write_generation_config_writes_valid_json_with_cli_values(tmp_path):
     assert data["temperature"] == 0.42
     assert data["top_p"] == 0.9
     assert data["top_k"] == 15
-    # And the locked fields are still there:
     assert data["do_sample"] is True
     assert data["eos_token_id"] == list(QWEN3_EOS_TOKEN_IDS)
 
@@ -97,9 +91,6 @@ def test_chat_templates_byte_match_returns_false_on_one_byte_drift(tmp_path):
 
 
 def test_chat_templates_byte_match_catches_trailing_newline_drift(tmp_path):
-    """The whole point of this check is catching invisible diffs that
-    HF tokenizer.save_pretrained sometimes introduces (e.g. stripping
-    a trailing newline)."""
     a = tmp_path / "a.jinja"
     b = tmp_path / "b.jinja"
     a.write_text("hello\n", encoding="utf-8")
@@ -222,8 +213,6 @@ def test_run_file_preflight_fails_when_generation_config_is_missing_a_key(tmp_pa
 
 
 def test_run_file_preflight_fails_on_chat_template_byte_drift(tmp_path):
-    """The silent-failure mode flagged in CLAUDE.md: any drift in the
-    locked Jinja silently breaks thinking mode at CI time."""
     out = _good_dir(tmp_path / "out")
     (out / "chat_template.jinja").write_text(
         LOCKED_TEMPLATE_TEXT + "extra\n", encoding="utf-8"
@@ -234,9 +223,6 @@ def test_run_file_preflight_fails_on_chat_template_byte_drift(tmp_path):
 
 
 def test_run_file_preflight_accepts_chat_template_in_tokenizer_config(tmp_path):
-    """Some transformers versions embed chat_template inside
-    tokenizer_config.json instead of writing a sidecar .jinja. The
-    preflight must accept either."""
     out = _good_dir(tmp_path / "out")
     (out / "chat_template.jinja").unlink()
     (out / "tokenizer_config.json").write_text(
@@ -247,10 +233,28 @@ def test_run_file_preflight_accepts_chat_template_in_tokenizer_config(tmp_path):
 
 
 # =============================================================================
-# default_commit_message
+# CLI surface — required args + generation_config knobs flow through.
 # =============================================================================
 
-def test_default_commit_message_includes_adapter_basename(tmp_path):
-    msg = default_commit_message(tmp_path / "runs" / "some-run-name" / "final")
-    assert "final" in msg
-    assert "eval_loss" not in msg
+def test_merge_cli_requires_adapter_dir():
+    from scripts.merge import _parse_args
+    with pytest.raises(SystemExit):
+        _parse_args([])
+
+
+def test_merge_cli_sampling_flags_flow_into_generation_config(tmp_path):
+    """Confirm --temperature / --top-p / --top-k parse and would land in
+    the generation_config.json payload built from those args."""
+    from scripts.merge import _parse_args
+    args = _parse_args([
+        "--adapter-dir", str(tmp_path),
+        "--temperature", "0.55",
+        "--top-p", "0.9",
+        "--top-k", "30",
+    ])
+    cfg = build_generation_config(
+        temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
+    )
+    assert cfg["temperature"] == 0.55
+    assert cfg["top_p"] == 0.9
+    assert cfg["top_k"] == 30

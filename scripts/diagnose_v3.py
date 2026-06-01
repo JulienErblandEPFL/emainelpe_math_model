@@ -2,7 +2,7 @@
 
 Characterizes v3's failure modes across three eval targets so the team can
 design a targeted v4 dataset to fix coverage gaps. NOT a CI-faithful
-headline score — that's ``scripts/eval_local.py``'s job. This script's
+headline score — that's ``scripts/run_eval.py``'s job. This script's
 job is to surface *where* v3 breaks (per subject, per level, per failure
 mode) at scale.
 
@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 # Constants (eval contract — see CLAUDE.md "Eval contract" + Stage 4)
 # -----------------------------------------------------------------------------
 
-# CI-faithful caps (same as scripts/eval_local.py default).
+# CI-faithful caps (same as scripts/run_eval.py default).
 MAX_MODEL_LEN = 4096
 MAX_NEW_TOKENS = 4096
 # Truncation threshold: within 6 of cap (token-level). Tokens >= this AND no
@@ -712,7 +712,7 @@ def _self_check_chat_template(model_path: str, sample_prompt: str) -> None:
     Fail-fast: raises RuntimeError on mismatch (with a short diff snippet).
     Catches the bug class where v3 was pushed with a stale chat template.
     """
-    from scripts.eval_local import (
+    from scripts.run_eval import (
         load_tokenizer_with_locked_template,
         render_prompts,
         DEFAULT_CHAT_TEMPLATE,
@@ -720,7 +720,7 @@ def _self_check_chat_template(model_path: str, sample_prompt: str) -> None:
 
     # A: model dir's bundled template (whatever Stage 5 pushed).
     tok_a = _load_tokenizer_from_model_dir(model_path)
-    # B: team-locked Jinja (the same path eval_local.py uses).
+    # B: team-locked Jinja (the same path run_eval.py uses).
     tok_b = load_tokenizer_with_locked_template(model_path, DEFAULT_CHAT_TEMPLATE)
 
     items = [{"prompt": sample_prompt, "answer": ""}]
@@ -775,8 +775,8 @@ def _generate(
     """
     from vllm import SamplingParams  # type: ignore
 
-    # Re-use eval_local.render_prompts so the prompt formatting is byte-identical.
-    from scripts.eval_local import render_prompts
+    # Re-use run_eval.render_prompts so the prompt formatting is byte-identical.
+    from scripts.run_eval import render_prompts
 
     items = [{"prompt": p["problem"], "answer": p["gold_answer"]} for p in problems]
     prompts = render_prompts(tokenizer, items)

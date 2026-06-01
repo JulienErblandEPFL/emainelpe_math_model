@@ -673,7 +673,7 @@ def test_assert_prompts_are_chat_templated_samples_only_first_n():
 # root) on sys.path, so the deferred ``from scripts.reward_fn import
 # compute_reward`` at line 399 / 649 could not resolve. The fix is the
 # canonical sys.path.insert snippet at the top of train_rlvr.py — same
-# idiom as eval_local.py and prepare_rlvr.py.
+# idiom as run_eval.py and prepare_rlvr.py.
 #
 # This test catches the regression cheaply: ``--help`` exits before any
 # GPU/TRL/torch code runs, but still triggers module-level imports.

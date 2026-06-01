@@ -1,9 +1,9 @@
 """CPU-only unit tests for scripts/sample_failures.
 
 All tests target pure helpers — no torch / transformers / vllm imports.
-Heavy runtime helpers are reused from ``scripts.eval_local`` and tested
+Heavy runtime helpers are reused from ``scripts.run_eval`` and tested
 there; this file covers only the *new* logic in sample_failures:
-JSONL parsing (delegated to eval_local but exercised end-to-end here),
+JSONL parsing (delegated to run_eval but exercised end-to-end here),
 threshold semantics, output row construction, and summary formatting.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from scripts.sample_failures import (
     resolve_sampling_params,
     write_failures_jsonl,
 )
-from scripts.eval_local import load_eval_jsonl, normalize_input_row
+from scripts.run_eval import load_eval_jsonl, normalize_input_row
 
 
 # -----------------------------------------------------------------------------
@@ -185,7 +185,7 @@ def test_resolve_sampling_params_prefers_cli_then_gen_config():
         n=4, max_new_tokens=4096, seed=42,
     )
 
-    # No generation_config.json → falls back to eval_local's FALLBACK_TOP_P / K.
+    # No generation_config.json → falls back to run_eval's FALLBACK_TOP_P / K.
     params = resolve_sampling_params(args, gen_config_dict=None)
     assert params["temperature"] == 0.4
     assert params["top_p"] == 0.95

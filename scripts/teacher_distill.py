@@ -57,9 +57,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Pure helpers shared with teacher_smoke; both reuse eval_local's
+# Pure helpers shared with teacher_smoke; both reuse run_eval's
 # stdlib-only loaders. None of these pulls torch at import time.
-from scripts.eval_local import load_eval_jsonl, normalize_input_row
+from scripts.run_eval import load_eval_jsonl, normalize_input_row
 from scripts.teacher_smoke import (
     SYSTEM_PROMPT,
     build_chat_messages,

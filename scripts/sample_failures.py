@@ -1,6 +1,6 @@
 """Sample a math model on a problem set and dump the failures.
 
-Companion to ``scripts/eval_local.py``: same vLLM front-end, same
+Companion to ``scripts/run_eval.py``: same vLLM front-end, same
 locked chat template, same ``evaluate.score.score_generations`` scoring
 path, but the output is the *per-problem* failure list rather than the
 pass@k summary.
@@ -14,7 +14,7 @@ correct (pass@n = 0).
 Pure helpers (``is_failure``, ``build_failure_rows``,
 ``format_failure_summary``, ``resolve_sampling_params``,
 ``write_failures_jsonl``) live at module scope and are CPU-testable.
-Heavy runtime helpers are imported from ``scripts.eval_local`` and
+Heavy runtime helpers are imported from ``scripts.run_eval`` and
 defer ``torch`` / ``transformers`` / ``vllm`` into their bodies, so
 laptop unit tests run without those wheels.
 
@@ -43,9 +43,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Reuse eval_local's pure helpers (cheap stdlib only). Runtime helpers
+# Reuse run_eval's pure helpers (cheap stdlib only). Runtime helpers
 # that need torch/transformers/vllm are imported inside main().
-from scripts.eval_local import (
+from scripts.run_eval import (
     DEFAULT_CHAT_TEMPLATE,
     DEFAULT_GPU_MEMORY_UTILIZATION,
     DEFAULT_SEED,
@@ -162,9 +162,9 @@ def resolve_sampling_params(
        ``generation_config.json``); ``--top-p`` / ``--top-k`` default
        to ``None`` so they fall through to the model's config.
     2. ``generation_config.json`` from the model dir (if present), then
-       eval_local's ``FALLBACK_TOP_P`` / ``FALLBACK_TOP_K``.
+       run_eval's ``FALLBACK_TOP_P`` / ``FALLBACK_TOP_K``.
 
-    Unlike ``eval_local.resolve_sampling_params`` this does *not*
+    Unlike ``run_eval.resolve_sampling_params`` this does *not*
     WARNING-log on CLI presence — the failure-mining script's defaults
     are deliberately aligned with the v5 pushed sampling contract, so a
     matching CLI value is not "drift" worth flagging.
@@ -315,8 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     items = [normalize_input_row(r) for r in raw_rows]
     logger.info("loaded %d problems from %s", len(items), args.prompt_set)
 
-    # 2. Runtime imports happen here (eval_local helpers).
-    from scripts.eval_local import (
+    # 2. Runtime imports happen here (run_eval helpers).
+    from scripts.run_eval import (
         assert_model_supports_max_len,
         load_tokenizer_with_locked_template,
         render_prompts,

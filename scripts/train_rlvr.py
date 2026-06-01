@@ -31,7 +31,7 @@ scope and are CPU-testable. The heavy ML imports (``torch``, ``peft``,
 ``trl``, ``transformers``) are deferred into ``main()``.
 
 Saves the trained adapter to ``<output-dir>/final/`` with the SAME on-
-disk shape as ``scripts/train_sft.py``, so ``scripts/merge_and_push.py
+disk shape as ``scripts/train_sft.py``, so ``scripts/merge.py / push.py
 --adapter-dir <output-dir>/final`` will fold the RLVR-tuned adapter
 into a deployable checkpoint without code changes.
 """
@@ -55,7 +55,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # ``from evaluate.X import ...`` work whether the script is invoked via
 # ``python scripts/train_rlvr.py`` (which prepends scripts/ to sys.path,
 # hiding the scripts package) or ``python -m scripts.train_rlvr``. Same
-# idiom as scripts/eval_local.py and data/prepare_rlvr.py.
+# idiom as scripts/run_eval.py and data/prepare_rlvr.py.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -1004,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
     trainer.train()
 
     # Save adapter + tokenizer (with chat template). Same on-disk shape as
-    # train_sft.py so merge_and_push.py works without changes.
+    # train_sft.py so merge.py / push.py works without changes.
     final_dir = args.output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(final_dir))
