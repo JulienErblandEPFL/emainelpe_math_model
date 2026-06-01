@@ -1164,7 +1164,7 @@ def test_v4_mix_normalize_math_train_handles_separate_answer_field():
 
 def test_v4_mix_normalize_math_train_handles_subject_variant():
     """'Counting and Probability' (some forks) canonicalizes to
-    'Counting & Probability' to match diagnose_v3.MATH_SUBJECTS."""
+    'Counting & Probability' to match diagnose.MATH_SUBJECTS."""
     raw = _v4_math_row(
         problem="p", gold="1",
         subject="Counting and Probability", level=2,

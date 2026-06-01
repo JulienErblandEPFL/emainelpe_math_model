@@ -153,7 +153,7 @@ V4_DEFAULT_NUMINAMATH_COUNT = 5_000
 V4_MAX_FORMATTED_TOKENS_DEFAULT = 2900
 
 # Canonical Hendrycks MATH subject names. Use the same labels as the
-# v3 diagnostic (``scripts/diagnose_v3.MATH_SUBJECTS``) so per-subject
+# v3 diagnostic (``scripts/diagnose.MATH_SUBJECTS``) so per-subject
 # composition is grep-aligned across the codebase.
 MATH_SUBJECT_INTERMEDIATE_ALGEBRA = "Intermediate Algebra"
 MATH_SUBJECT_PRECALCULUS = "Precalculus"
@@ -464,7 +464,7 @@ def normalize_math_train_row(raw: dict) -> dict | None:
     subject = raw.get("type") or raw.get("subject")
     if subject == "Counting and Probability":
         # Some forks use 'and'; canonicalize to '&' to match
-        # diagnose_v3.MATH_SUBJECTS.
+        # diagnose.MATH_SUBJECTS.
         subject = "Counting & Probability"
     level = _math_level_to_string(raw.get("level"))
 

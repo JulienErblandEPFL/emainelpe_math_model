@@ -1,17 +1,21 @@
-"""Diagnostic eval for the v3 SFT checkpoint.
+"""General diagnostic eval for any merged math checkpoint.
 
-Characterizes v3's failure modes across three eval targets so the team can
-design a targeted v4 dataset to fix coverage gaps. NOT a CI-faithful
+Produces three eval surfaces — validation (N=10), in-distribution
+held-out (N=500), and the HuggingFace MATH test set — with per-subject,
+per-level, and failure-mode breakdowns. Scoring is byte-identical to
+the nightly CI via the vendored ``evaluate/`` package. NOT a CI-faithful
 headline score — that's ``scripts/run_eval.py``'s job. This script's
-job is to surface *where* v3 breaks (per subject, per level, per failure
-mode) at scale.
+job is to surface *where* the model breaks (per subject, per level, per
+failure mode) at scale.
 
 Eval targets (run all three by default):
 
   1. ``validation_samples/math.jsonl`` (OOD, N=10, n=8). Pipeline
      sanity check before committing to longer runs.
-  2. ``/scratch/Julien/data_out_v3/eval.jsonl`` (in-distribution DART
-     held-out, N=500, n=4).
+  2. In-distribution held-out eval set (the ``eval.jsonl`` split from
+     ``data/prepare_sft.py`` for the model under test, N=500, n=4).
+     Pass the path via ``--indist-file``; targets that include the
+     in-distribution surface require this flag.
   3. HuggingFace MATH test set (~5000 problems, subject-tagged, n=4).
      Tries ``HuggingFaceH4/MATH-500`` first, falls back to
      ``hendrycks/competition_math``.
@@ -43,13 +47,15 @@ at module scope and are CPU-testable. Heavy imports (``vllm``,
 Resumability: each target writes a ``completed.marker`` empty file when
 done. Reruns skip completed targets unless ``--force`` is passed.
 
-Typical cluster invocation (after ``git pull`` on RCP):
+Typical invocation:
 
     # smoke (validation only, 2 problems)
-    python scripts/diagnose_v3.py --target validation --limit 2
+    python scripts/diagnose.py --model <path/to/merged_model> \\
+        --target validation --limit 2
 
     # full run (all three targets, ~6h wall-clock)
-    python scripts/diagnose_v3.py --target all
+    python scripts/diagnose.py --model <path/to/merged_model> \\
+        --indist-file data_out/<name>/eval.jsonl --target all
 """
 from __future__ import annotations
 
@@ -137,9 +143,7 @@ PER_PROBLEM_FM_KEYS: tuple[str, ...] = (
     "no_box", "wrong_box", "truncated", "repetition", "other",
 )
 
-DEFAULT_MODEL = "/scratch/Julien/merged/math_model_v3"
-DEFAULT_INDIST_PATH = "/scratch/Julien/data_out_v3/eval.jsonl"
-DEFAULT_OUTPUT_ROOT = "/scratch/Julien/diagnostics"
+DEFAULT_OUTPUT_ROOT = str(REPO_ROOT / "runs" / "diagnostics")
 DEFAULT_VALIDATION_PATH = str(REPO_ROOT / "validation_samples" / "math.jsonl")
 
 ALL_TARGETS: tuple[str, ...] = ("validation", "indist", "math_test")
@@ -382,7 +386,7 @@ def load_validation_problems(path: Path) -> list[dict]:
 
 
 def load_indist_problems(path: Path) -> list[dict]:
-    """Load /scratch/Julien/data_out_v3/eval.jsonl. Messages schema.
+    """Load an in-distribution eval.jsonl (from data/prepare_sft.py). Messages schema.
 
     Each row: {"messages": [user_msg, assistant_msg]}. Extracts the user
     content as the problem and the LAST \\boxed{...} from the assistant
@@ -867,8 +871,8 @@ def _run_target(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--model", default=DEFAULT_MODEL,
-        help=f"Path to merged checkpoint. Default: {DEFAULT_MODEL}",
+        "--model", required=True,
+        help="Path to merged checkpoint (or HF hub id).",
     )
     p.add_argument(
         "--target",
@@ -884,7 +888,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-dir", type=Path, default=None,
         help=(
             "Output directory. Default: "
-            f"{DEFAULT_OUTPUT_ROOT}/v3_eval_<utc-timestamp>"
+            f"{DEFAULT_OUTPUT_ROOT}/diagnose_<utc-timestamp>"
         ),
     )
     p.add_argument(
@@ -892,8 +896,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"validation_samples path. Default: {DEFAULT_VALIDATION_PATH}",
     )
     p.add_argument(
-        "--indist-file", type=Path, default=Path(DEFAULT_INDIST_PATH),
-        help=f"in-distribution eval path. Default: {DEFAULT_INDIST_PATH}",
+        "--indist-file", type=Path, default=None,
+        help="In-distribution eval.jsonl produced by data/prepare_sft.py "
+             "(e.g. data_out/<name>/eval.jsonl). Required when --target "
+             "includes 'indist' (or 'all'); ignored otherwise.",
     )
     p.add_argument(
         "--gpu-memory-utilization", type=float, default=0.85,
@@ -911,7 +917,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _default_output_dir() -> Path:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return Path(DEFAULT_OUTPUT_ROOT) / f"v3_eval_{ts}"
+    return Path(DEFAULT_OUTPUT_ROOT) / f"diagnose_{ts}"
 
 
 def _resolve_targets(arg: str) -> list[str]:
@@ -937,6 +943,12 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("HF_HOME=%s", os.environ["HF_HOME"])
 
     targets = _resolve_targets(args.target)
+
+    if "indist" in targets and args.indist_file is None:
+        raise SystemExit(
+            "--target indist requires --indist-file (the held-out eval.jsonl "
+            "produced by data/prepare_sft.py, e.g. data_out/<name>/eval.jsonl)."
+        )
 
     # Resumability: skip targets that are already complete unless --force.
     to_run: list[str] = []

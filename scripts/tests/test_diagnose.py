@@ -1,4 +1,4 @@
-"""Tests for ``scripts/diagnose_v3.py`` — v3 SFT failure-mode diagnostic.
+"""Tests for ``scripts/diagnose.py`` — v3 SFT failure-mode diagnostic.
 
 CPU-only. The module under test gates ``vllm``/``transformers``/``datasets``
 imports inside runtime helpers (``_build_llm``, ``_self_check_chat_template``,
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.diagnose_v3 import (
+from scripts.diagnose import (
     ALL_FAILURE_MODES,
     ALL_TARGETS,
     FM_CORRECT,
@@ -560,6 +560,35 @@ def test_parse_args_limit_parses_int():
 def test_parse_args_force_flag():
     args = _parse_args(["--model", "x", "--force"])
     assert args.force is True
+
+
+def test_parse_args_requires_model():
+    """--model has no default and must be explicit (no /scratch fallback)."""
+    import pytest
+    with pytest.raises(SystemExit):
+        _parse_args([])
+
+
+def test_parse_args_indist_file_defaults_to_none():
+    """No more hardcoded /scratch indist default — the flag must default
+    to None and only be required when the user actually asks for the
+    indist target."""
+    args = _parse_args(["--model", "x"])
+    assert args.indist_file is None
+
+
+def test_main_rejects_indist_target_without_indist_file(tmp_path):
+    """When --target includes indist (default 'all'), main() must fail
+    loudly if --indist-file was not supplied. validation/math_test alone
+    must still work without it."""
+    import pytest
+    from scripts.diagnose import main
+    with pytest.raises(SystemExit, match="--indist-file"):
+        main([
+            "--model", "x",
+            "--target", "indist",
+            "--output-dir", str(tmp_path / "out"),
+        ])
 
 
 def test_resolve_targets_expands_all():
