@@ -14,14 +14,15 @@ scope and are CPU-testable. The heavy ML pieces (``transformers``,
 Dry-run (default — does everything except the HF push)::
 
     python scripts/merge_and_push.py \\
-        --adapter-dir /scratch/Julien/runs/.../final \\
-        --output-dir  /scratch/Julien/merged/math_model_v1
+        --adapter-dir <path/to/adapter/final> \\
+        --output-dir  <path/to/merged_model>
 
-Push to the team repo::
+Push to a HF repo (must specify --hf-repo explicitly)::
 
     python scripts/merge_and_push.py \\
-        --adapter-dir /scratch/Julien/runs/.../final \\
-        --output-dir  /scratch/Julien/merged/math_model_v1 \\
+        --adapter-dir <path/to/adapter/final> \\
+        --output-dir  <path/to/merged_model> \\
+        --hf-repo     <your-org/your-repo> \\
         --push
 
 Out of scope (deferred — see CLAUDE.md and IMPLEMENTATION_PLAN.md):
@@ -47,11 +48,7 @@ logger = logging.getLogger("merge_and_push")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCKED_TEMPLATE = REPO_ROOT / "chat_template" / "chat_template.jinja"
 
-DEFAULT_ADAPTER_DIR = Path(
-    "/scratch/Julien/runs/cs552-erbland-g65-train-20260508-150203/final"
-)
-DEFAULT_OUTPUT_DIR = Path("/scratch/Julien/merged/math_model_v1")
-DEFAULT_HF_REPO = "cs-552-2026-emainelpe/math_model"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "merged_model"
 
 BASE_MODEL_ID = "Qwen/Qwen3-1.7B"
 
@@ -224,7 +221,7 @@ def run_file_preflight(output_dir: Path, locked_template: Path) -> None:
 
 
 def default_commit_message(adapter_dir: Path) -> str:
-    return f"SFT merge from {Path(adapter_dir).name}, eval_loss=0.3803"
+    return f"merged model from {Path(adapter_dir).name}"
 
 
 # =============================================================================
@@ -237,16 +234,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     "push the merged checkpoint to the team HF org.",
     )
     p.add_argument(
-        "--adapter-dir", type=Path, default=DEFAULT_ADAPTER_DIR,
+        "--adapter-dir", type=Path, required=True,
         help="Path to the trained adapter dir (must exist).",
     )
     p.add_argument(
         "--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
-        help="Where to write the merged checkpoint locally.",
+        help=f"Where to write the merged checkpoint locally. "
+             f"Default: {DEFAULT_OUTPUT_DIR} (repo-relative).",
     )
     p.add_argument(
-        "--hf-repo", default=DEFAULT_HF_REPO,
-        help="HF repo to push to. Default: the team org repo.",
+        "--hf-repo", default=None,
+        help="HF repo to push to (e.g. 'your-org/your-repo'). No default; "
+             "required when --push is set.",
     )
     p.add_argument(
         "--temperature", type=float, default=0.4,
@@ -264,8 +263,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--commit-message", default=None,
-        help="HF commit message. Default: 'SFT merge from <adapter-dir>, "
-             "eval_loss=0.3803'.",
+        help="HF commit message. Default: 'merged model from <adapter-dir-basename>'.",
     )
     p.add_argument(
         "--locked-template", type=Path, default=DEFAULT_LOCKED_TEMPLATE,
@@ -416,6 +414,13 @@ def main(argv: list[str] | None = None) -> int:
     output_dir: Path = args.output_dir
     locked_template: Path = args.locked_template
     commit_message = args.commit_message or default_commit_message(adapter_dir)
+
+    if args.push and not args.hf_repo:
+        logger.error(
+            "--push requires --hf-repo; refusing to guess. "
+            "Pass --hf-repo <your-org/your-repo> explicitly."
+        )
+        return 2
 
     if not adapter_dir.is_dir():
         logger.error("Adapter dir does not exist: %s", adapter_dir)

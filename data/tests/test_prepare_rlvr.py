@@ -96,6 +96,9 @@ def test_difficulty_filter_band_is_configurable():
     """
     # 1. CLI parsing: the flags exist and pick up custom values.
     args = _parse_args([
+        "--input-jsonl", "/tmp/i.jsonl",
+        "--sft-model-path", "/tmp/m",
+        "--output-jsonl", "/tmp/o.jsonl",
         "--difficulty-lo", "0.35",
         "--difficulty-hi", "0.65",
     ])
@@ -118,7 +121,11 @@ def test_difficulty_filter_band_is_configurable():
     assert kept_ids == ["exact_lo", "middle", "exact_hi"]
 
     # 3. Defaults still reflect the proposal's [0.2, 0.8] band.
-    default_args = _parse_args([])
+    default_args = _parse_args([
+        "--input-jsonl", "/tmp/i.jsonl",
+        "--sft-model-path", "/tmp/m",
+        "--output-jsonl", "/tmp/o.jsonl",
+    ])
     assert default_args.difficulty_lo == DIFFICULTY_LO
     assert default_args.difficulty_hi == DIFFICULTY_HI
 
@@ -414,7 +421,11 @@ def test_build_scored_row_round_trips_through_write_jsonl(tmp_path: Path):
 # =============================================================================
 
 def test_parse_args_defaults():
-    args = _parse_args([])
+    args = _parse_args([
+        "--input-jsonl", "/tmp/i.jsonl",
+        "--sft-model-path", "/tmp/m",
+        "--output-jsonl", "/tmp/o.jsonl",
+    ])
     assert args.pool_size == 10000
     assert args.target_size == 5000
     assert args.num_generations == 8
@@ -427,11 +438,21 @@ def test_parse_args_defaults():
 
 
 def test_parse_args_dry_run_flag():
-    args = _parse_args(["--dry-run"])
+    args = _parse_args([
+        "--input-jsonl", "/tmp/i.jsonl",
+        "--sft-model-path", "/tmp/m",
+        "--output-jsonl", "/tmp/o.jsonl",
+        "--dry-run",
+    ])
     assert args.dry_run is True
 
 
 def test_parse_args_custom_band():
-    args = _parse_args(["--difficulty-lo", "0.1", "--difficulty-hi", "0.9"])
+    args = _parse_args([
+        "--input-jsonl", "/tmp/i.jsonl",
+        "--sft-model-path", "/tmp/m",
+        "--output-jsonl", "/tmp/o.jsonl",
+        "--difficulty-lo", "0.1", "--difficulty-hi", "0.9",
+    ])
     assert args.difficulty_lo == 0.1
     assert args.difficulty_hi == 0.9

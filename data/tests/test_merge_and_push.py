@@ -250,7 +250,7 @@ def test_run_file_preflight_accepts_chat_template_in_tokenizer_config(tmp_path):
 # default_commit_message
 # =============================================================================
 
-def test_default_commit_message_includes_adapter_basename_and_eval_loss(tmp_path):
+def test_default_commit_message_includes_adapter_basename(tmp_path):
     msg = default_commit_message(tmp_path / "runs" / "some-run-name" / "final")
     assert "final" in msg
-    assert "eval_loss=0.3803" in msg
+    assert "eval_loss" not in msg

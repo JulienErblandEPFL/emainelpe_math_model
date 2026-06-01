@@ -55,7 +55,7 @@ LORA_YAML = REPO_ROOT / "configs" / "lora.yaml"
 # =============================================================================
 
 def test_parse_args_defaults_match_d5():
-    args = _parse_args(["--output-dir", "/tmp/x"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl"])
     assert args.learning_rate == 3e-6
     assert args.kl_coef == 0.04
     assert args.rollout_temp == 0.8
@@ -76,7 +76,7 @@ def test_parse_args_requires_output_dir():
 
 
 def test_parse_args_dry_run():
-    args = _parse_args(["--output-dir", "/tmp/x", "--dry-run"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl", "--dry-run"])
     assert args.dry_run is True
 
 
@@ -89,7 +89,7 @@ def test_parse_args_length_bonus_defaults_off():
     from this default, which short-circuits the length term inside
     reward_fn.compute_reward.
     """
-    args = _parse_args(["--output-dir", "/tmp/x"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl"])
     assert args.length_bonus_weight == 0.0
     assert args.target_length_tokens == 1024
 
@@ -102,6 +102,8 @@ def test_parse_args_length_bonus_custom_values():
     """
     args = _parse_args([
         "--output-dir", "/tmp/x",
+        "--adapter-dir", "/tmp/a",
+        "--prompt-set", "/tmp/p.jsonl",
         "--length-bonus-weight", "0.1",
         "--target-length-tokens", "512",
     ])
@@ -273,7 +275,7 @@ def test_validate_max_new_tokens_warns_above_training_seq():
 # =============================================================================
 
 def test_grpo_config_kwargs_passes_d5_defaults():
-    args = _parse_args(["--output-dir", "/tmp/x"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl"])
     yaml_dict = {"max_seq_length": 4096}
     out = grpo_config_kwargs(
         args=args, yaml_dict=yaml_dict, precision="bf16",
@@ -298,7 +300,7 @@ def test_grpo_config_kwargs_passes_d5_defaults():
 
 
 def test_grpo_config_kwargs_fp16_path():
-    args = _parse_args(["--output-dir", "/tmp/x"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl"])
     out = grpo_config_kwargs(
         args=args, yaml_dict={"max_seq_length": 4096}, precision="fp16",
         run_name="rlvr-test", use_wandb=False,
@@ -308,7 +310,7 @@ def test_grpo_config_kwargs_fp16_path():
 
 
 def test_grpo_config_kwargs_wandb_routing():
-    args = _parse_args(["--output-dir", "/tmp/x"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl"])
     out = grpo_config_kwargs(
         args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
         run_name="rlvr-test", use_wandb=True,
@@ -330,7 +332,7 @@ def test_grpo_config_kwargs_defaults_preserve_old_behavior():
       loss_type='dapo', use_vllm=False, vllm_gpu_memory_utilization=0.3,
       mask_truncated_completions=False, log_completions=False.
     """
-    args = _parse_args(["--output-dir", "/tmp/x"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl"])
     out = grpo_config_kwargs(
         args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
         run_name="rlvr-test", use_wandb=False,
@@ -346,6 +348,8 @@ def test_grpo_config_kwargs_includes_new_fields():
     """All 5 rescue knobs flow from CLI flags into the kwargs dict."""
     args = _parse_args([
         "--output-dir", "/tmp/x",
+        "--adapter-dir", "/tmp/a",
+        "--prompt-set", "/tmp/p.jsonl",
         "--loss-type", "grpo",
         "--use-vllm",
         "--vllm-gpu-memory-utilization", "0.45",
@@ -372,7 +376,7 @@ def test_grpo_config_includes_use_liger_kernel_true_by_default():
     """Default --use-liger-kernel=True must flow into GRPOConfig kwargs.
     The failed retry3 run's W&B config showed use_liger_kernel=False,
     leaving the same OOM door open for RL as v4 SFT hit at step 1514."""
-    args = _parse_args(["--output-dir", "/tmp/x"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl"])
     out = grpo_config_kwargs(
         args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
         run_name="rlvr-test", use_wandb=False,
@@ -390,7 +394,7 @@ def test_grpo_config_includes_use_liger_kernel_true_by_default():
 def test_grpo_config_use_liger_kernel_disables_when_cli_overrides():
     """`--no-use-liger-kernel` flips GRPOConfig's field to False for
     A/B comparison."""
-    args = _parse_args(["--output-dir", "/tmp/x", "--no-use-liger-kernel"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl", "--no-use-liger-kernel"])
     out = grpo_config_kwargs(
         args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
         run_name="rlvr-test", use_wandb=False,
@@ -401,12 +405,12 @@ def test_grpo_config_use_liger_kernel_disables_when_cli_overrides():
 def test_parse_args_use_liger_kernel_default_is_true_rlvr():
     """argparse default for --use-liger-kernel is True so the default
     RLVR invocation gets the OOM-safe path."""
-    args = _parse_args(["--output-dir", "/tmp/x"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl"])
     assert args.use_liger_kernel is True
 
 
 def test_parse_args_no_use_liger_kernel_flips_to_false_rlvr():
-    args = _parse_args(["--output-dir", "/tmp/x", "--no-use-liger-kernel"])
+    args = _parse_args(["--output-dir", "/tmp/x", "--adapter-dir", "/tmp/a", "--prompt-set", "/tmp/p.jsonl", "--no-use-liger-kernel"])
     assert args.use_liger_kernel is False
 
 
@@ -564,7 +568,11 @@ def test_grpoconfig_accepts_all_kwargs(tmp_path: Path):
         inspect.signature(trl.GRPOConfig.__init__).parameters.keys()
     )
 
-    args = _parse_args(["--output-dir", str(tmp_path)])
+    args = _parse_args([
+        "--output-dir", str(tmp_path),
+        "--adapter-dir", "/tmp/a",
+        "--prompt-set", "/tmp/p.jsonl",
+    ])
     kwargs = grpo_config_kwargs(
         args=args, yaml_dict={"max_seq_length": 4096}, precision="bf16",
         run_name="rlvr-test", use_wandb=False,

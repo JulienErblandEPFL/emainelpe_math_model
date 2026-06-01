@@ -62,13 +62,6 @@ if str(REPO_ROOT) not in sys.path:
 DEFAULT_LORA_YAML = REPO_ROOT / "configs" / "lora.yaml"
 DEFAULT_CHAT_TEMPLATE = REPO_ROOT / "chat_template" / "chat_template.jinja"
 
-# Defaults reflect the v3 SFT pipeline outputs as of 2026-05-11
-# (post-temperature-sweep — v3 OMI2-only is the SFT winner).
-DEFAULT_ADAPTER_DIR = Path(
-    "/scratch/Julien/runs/cs552-erbland-g65-v3-omi2-fix2-20260511-152150/final"
-)
-DEFAULT_PROMPT_SET = Path("/scratch/Julien/data_out/rlvr_prompts.jsonl")
-
 WANDB_PROJECT_DEFAULT = "emainelpe-math"
 
 # Preflight thresholds. Tuned conservatively; flip via CLI if a
@@ -385,15 +378,13 @@ def choose_precision(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--adapter-dir", type=Path, default=DEFAULT_ADAPTER_DIR,
+        "--adapter-dir", type=Path, required=True,
         help="Trained SFT adapter dir (PeftModel.from_pretrained input). "
-             "Default is the v3 SFT winner — pure OMI2, the post-2026-05-11 "
-             "temperature-sweep choice. NOT the merged checkpoint dir; this "
-             "must contain adapter_config.json + adapter_model.safetensors. "
-             f"Default: {DEFAULT_ADAPTER_DIR}",
+             "NOT the merged checkpoint dir; this must contain "
+             "adapter_config.json + adapter_model.safetensors.",
     )
     p.add_argument(
-        "--prompt-set", type=Path, default=DEFAULT_PROMPT_SET,
+        "--prompt-set", type=Path, required=True,
         help="Curated RLVR prompts JSONL (from data/prepare_rlvr.py).",
     )
     p.add_argument("--output-dir", type=Path, required=True)

@@ -45,10 +45,6 @@ from evaluate.extract_answer import extract_boxed_answer  # noqa: E402
 
 logger = logging.getLogger("prepare_rlvr")
 
-DEFAULT_INPUT = Path("/scratch/Julien/data_out_v3/train.jsonl")
-DEFAULT_OUTPUT = Path("/scratch/Julien/data_out_v3/rlvr_prompts.jsonl")
-DEFAULT_SFT_MODEL = Path("/scratch/Julien/merged/math_model_v3")
-
 DIFFICULTY_LO = 0.2
 DIFFICULTY_HI = 0.8
 
@@ -256,23 +252,19 @@ def write_jsonl(rows: Iterable[dict], path: Path) -> int:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--input-jsonl", type=Path, default=DEFAULT_INPUT,
-        help=f"Stage 1 train.jsonl. Default is the v3 SFT pool — pure OMI2, "
-             f"the post-2026-05-11 temperature-sweep choice "
-             f"(default: {DEFAULT_INPUT}).",
+        "--input-jsonl", type=Path, required=True,
+        help="Stage 1 train.jsonl produced by data/prepare_sft.py.",
     )
     p.add_argument(
-        "--sft-model-path", type=Path, default=DEFAULT_SFT_MODEL,
+        "--sft-model-path", type=Path, required=True,
         help="Path to the MERGED SFT checkpoint used to score difficulty. "
              "vLLM loads this — must be a complete model dir, not an adapter "
              "(different from train_rlvr.py's --adapter-dir, which takes the "
-             "unmerged adapter). Default matches the v3 SFT winner.",
+             "unmerged adapter).",
     )
     p.add_argument(
-        "--output-jsonl", type=Path, default=DEFAULT_OUTPUT,
-        help="Where to write the curated RLVR prompts. Default colocates "
-             "with the v3 SFT data so a single --output-dir override on "
-             "submit_rlvr.sh covers both.",
+        "--output-jsonl", type=Path, required=True,
+        help="Where to write the curated RLVR prompts JSONL.",
     )
     p.add_argument(
         "--pool-size", type=int, default=10000,
